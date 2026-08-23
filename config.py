@@ -17,8 +17,8 @@ load_dotenv()
 SUPPORTED_TRADING_ASSETS: frozenset[str] = frozenset(
     {"btc", "eth", "sol", "xrp", "doge", "hype", "bnb"}
 )
-SUPPORTED_WINDOWS: frozenset[str] = frozenset({"5m"})
-WINDOW_SECONDS: dict[str, int] = {"5m": 300}
+SUPPORTED_WINDOWS: frozenset[str] = frozenset({"5m", "15m"})
+WINDOW_SECONDS: dict[str, int] = {"5m": 300, "15m": 900}
 MIN_SHARES: int = 5
 
 _ASSET_ALIASES: dict[str, str] = {
