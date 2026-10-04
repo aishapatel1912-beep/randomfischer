@@ -1,0 +1,28 @@
+{
+  "total_pnl": -0.55,
+  "wins": 0,
+  "losses": 1,
+  "win_rate": "0.0%",
+  "trades": [
+    {
+      "timestamp": "2026-10-04 10:50:00",
+      "market": "Bitcoin Up or Down - October 4, 6:45AM-6:50AM ET",
+      "slug": "btc-updown-5m-1791110700",
+      "type": "GABAGOOL_SETTLE",
+      "pnl": -0.55,
+      "cumulative_pnl": -0.55,
+      "details": {
+        "outcome": "NO",
+        "yes_shares": 20.0,
+        "no_shares": 15.0,
+        "matched_pairs": 15.0,
+        "yes_unpaired": 5.0,
+        "no_unpaired": 0.0,
+        "total_cost": 15.55,
+        "settlement_value": 15.0,
+        "entry_count": 7,
+        "duration_seconds": -0.0
+      }
+    }
+  ]
+}

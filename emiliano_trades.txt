@@ -1,2 +1,24 @@
 2026-07-30 12:56:37 [MOMENTUM LIVE] NO trigger=0.9000 size=5.1 | NO=5.09@91c | inv Y=0.0 N=5.1
 2026-07-30 12:57:54 [MOMENTUM LIVE] NO trigger=0.9000 size=5.1 | NO=5.09@91c | inv Y=0.0 N=5.1
+2026-10-04 11:47:35 [GABAGOOL DRY] YES ask=0.2900 reason=first_cheap_leg size=5.0 | YES=5.00@29c | inv Y=5.0 N=0.0
+2026-10-04 11:47:35 [GABAGOOL DRY] NO ask=0.4600 reason=first_cheap_leg size=5.0 | NO=5.00@46c | inv Y=0.0 N=5.0
+2026-10-04 11:47:36 [GABAGOOL DRY] YES ask=0.1400 reason=first_cheap_leg size=5.0 | YES=5.00@14c | inv Y=5.0 N=0.0
+2026-10-04 11:47:38 [GABAGOOL DRY] YES ask=0.5200 reason=hedge_underweight size=5.0 | YES=5.00@52c | inv Y=5.0 N=5.0
+2026-10-04 11:47:38 [GABAGOOL DRY] YES ask=0.5200 reason=balanced_cheap_leg size=5.0 | YES=5.00@52c | inv Y=10.0 N=5.0
+2026-10-04 11:47:41 [GABAGOOL DRY] NO ask=0.4600 reason=hedge_underweight size=5.0 | NO=5.00@46c | inv Y=10.0 N=10.0
+2026-10-04 11:47:43 [GABAGOOL DRY] NO ask=0.4600 reason=balanced_cheap_leg size=5.0 | NO=5.00@46c | inv Y=10.0 N=15.0
+2026-10-04 11:47:59 [GABAGOOL DRY] YES ask=0.5100 reason=hedge_underweight size=5.0 | YES=5.00@51c | inv Y=15.0 N=15.0
+2026-10-04 11:48:01 [GABAGOOL DRY] YES ask=0.5100 reason=balanced_cheap_leg size=5.0 | YES=5.00@51c | inv Y=20.0 N=15.0
+2026-10-04 11:48:26 [GABAGOOL DRY] NO ask=0.6600 reason=hedge_underweight size=5.0 | NO=5.00@66c | inv Y=5.0 N=5.0
+2026-10-04 11:48:28 [GABAGOOL DRY] NO ask=0.4600 reason=hedge_underweight size=5.0 | NO=5.00@46c | inv Y=20.0 N=20.0
+2026-10-04 11:48:30 [GABAGOOL DRY] NO ask=0.6800 reason=hedge_underweight size=5.0 | NO=5.00@68c | inv Y=5.0 N=5.0
+2026-10-04 11:48:31 [GABAGOOL DRY] NO ask=0.5100 reason=balanced_cheap_leg size=5.0 | NO=5.00@51c | inv Y=5.0 N=10.0
+2026-10-04 11:48:33 [GABAGOOL DRY] YES ask=0.3000 reason=balanced_cheap_leg size=5.0 | YES=5.00@30c | inv Y=10.0 N=5.0
+2026-10-04 11:48:35 [GABAGOOL DRY] NO ask=0.7100 reason=hedge_underweight size=5.0 | NO=5.00@71c | inv Y=10.0 N=10.0
+2026-10-04 11:48:36 [GABAGOOL DRY] YES ask=0.2800 reason=balanced_cheap_leg size=5.0 | YES=5.00@28c | inv Y=15.0 N=10.0
+2026-10-04 11:48:37 [GABAGOOL DRY] NO ask=0.7300 reason=hedge_underweight size=5.0 | NO=5.00@73c | inv Y=15.0 N=15.0
+2026-10-04 11:48:39 [GABAGOOL DRY] YES ask=0.2700 reason=balanced_cheap_leg size=5.0 | YES=5.00@27c | inv Y=20.0 N=15.0
+2026-10-04 11:50:00 [DRY] redeem: YES @ 100c size=5.0000 | Market: Ethereum Up or Down - October 4, 6:45AM-6:50AM ET
+2026-10-04 11:50:00 [DRY] redeem: NO @ 100c size=5.0000 | Market: Ethereum Up or Down - October 4, 6:45AM-6:50AM ET
+2026-10-04 11:50:00 [DRY] redeem: YES @ 100c size=15.0000 | Market: Bitcoin Up or Down - October 4, 6:45AM-6:50AM ET
+2026-10-04 11:50:00 [DRY] redeem: YES @ 100c size=20.0000 | Market: Solana Up or Down - October 4, 6:45AM-6:50AM ET

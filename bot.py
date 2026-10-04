@@ -2751,7 +2751,12 @@ class MarketWorker:
             "no_avg_price_c":     0.0,
             "pair_avg_price_c":   0.0,
             "momentum_entry_threshold_c": round(worker_config.momentum_entry_threshold * 100),
-            "stop_loss_pct":      worker_config.stop_loss_pct,
+            "stop_loss_pct":      0.0,
+            "gabagool_initial_entry_threshold_c": round(worker_config.gabagool_initial_entry_threshold * 100, 1),
+            "gabagool_max_pair_cost_c": round(worker_config.gabagool_max_pair_cost * 100, 1),
+            "gabagool_min_profit_margin_c": round(worker_config.gabagool_min_profit_margin * 100, 1),
+            "gabagool_max_unpaired_shares": worker_config.gabagool_max_unpaired_shares,
+            "gabagool_min_time_to_resolution": worker_config.gabagool_min_time_to_resolution,
             "entry_count":        0,
         }
         self.recent_logs: Deque[str] = deque(maxlen=4)
@@ -2870,7 +2875,7 @@ class MarketWorker:
         self.dashboard["outcome"] = self.market_outcome or "PENDING"
         if inv.yes_shares > 0 or inv.no_shares > 0:
             self.dashboard["status"] = (
-                f"MOM Y{inv.yes_shares:.0f}/N{inv.no_shares:.0f}"
+                f"GAB Y{inv.yes_shares:.0f}/N{inv.no_shares:.0f}"
             )
 
     def get_listener_countdown(self) -> str:
@@ -2896,8 +2901,17 @@ class MarketWorker:
         return max(0, int(remaining.total_seconds()))
 
     def best_bid(self, side: str) -> float:
-        """Real best bid only — never synthesize from the ask."""
+        """Return the live best bid for a token."""
         return self.bids.get(side, 0.0)
+
+    def best_ask(self, side: str) -> float:
+        """Return the live executable best ask for a token.
+
+        ``prices`` is populated from Polymarket ``best_ask`` updates in the
+        market WebSocket listener. Gabagool BUY decisions must use this side
+        of the book rather than the bid.
+        """
+        return self.prices.get(side, 0.0)
 
     def can_enter(self) -> bool:
         wc = self.worker_config
@@ -2910,18 +2924,43 @@ class MarketWorker:
     def validate_entry_execution(
         self, decision: MomentumDecision, legs: List[Tuple[str, float]],
     ) -> bool:
-        wc = self.worker_config
+        """Re-check the Gabagool pair-cost guard immediately before submit."""
+        cfg = self.worker_config
         side = decision.side
         px = next((p for s, p in legs if s == side), 0.0)
-        if px <= 0 or is_locked_price(px):
+        ask = self.best_ask(side)
+        if px <= 0 or ask <= 0 or is_locked_price(px) or is_locked_price(ask):
             return False
-        if px < wc.momentum_entry_threshold:
+        if px + 1e-9 < ask:
             print(
-                f"❌ [MOMENTUM ABORT] {self.asset_type.upper()} {self.window_slug} | "
-                f"{side}@{round(px*100)}c below entry threshold "
-                f"{round(wc.momentum_entry_threshold*100)}c"
+                f"❌ [GABAGOOL ABORT] {self.asset_type.upper()} {self.window_slug} | "
+                f"limit={round(px*100)}c is below live ask={round(ask*100)}c"
             )
             return False
+        if self.market_seconds_left() < cfg.gabagool_min_time_to_resolution:
+            return False
+
+        inv = self.inventory
+        current = inv.shares(side)
+        other = "NO" if side == "YES" else "YES"
+        other_shares = inv.shares(other)
+        projected_unpaired = abs((current + decision.size) - other_shares)
+        if projected_unpaired > cfg.gabagool_max_unpaired_shares + 1e-9:
+            return False
+
+        other_avg = inv.avg_cost(other) if other_shares > MIN_FILL_DELTA else 0.0
+        current_avg = inv.avg_cost(side) if current > MIN_FILL_DELTA else 0.0
+        projected_avg = (
+            (current * current_avg) + (decision.size * px)
+        ) / max(current + decision.size, 1e-9)
+        if other_avg > 0:
+            projected_pair = projected_avg + other_avg
+            if projected_pair > cfg.gabagool_max_pair_cost + 1e-9:
+                print(
+                    f"❌ [GABAGOOL ABORT] projected pair="
+                    f"{projected_pair:.4f} > max={cfg.gabagool_max_pair_cost:.4f}"
+                )
+                return False
         return True
 
     def _track_order(self, order_id: Optional[str], side: str, size: float, price: float) -> None:
@@ -2969,7 +3008,7 @@ class MarketWorker:
     async def cancel_all_open_orders(self) -> None:
         for order_id, (side, size, price) in list(self._open_orders.items()):
             print(
-                f"🚫 [MOMENTUM CLEANUP] Cancelling open {side} order {order_id} "
+                f"🚫 [GABAGOOL CLEANUP] Cancelling open {side} order {order_id} "
                 f"({size:.2f}@{round(price*100)}c)"
             )
             await self.cancel_order_confirmed(order_id, size, price)
@@ -3108,43 +3147,13 @@ class MarketWorker:
         return True
 
     async def _check_stop_loss(self) -> bool:
-        """Exit open legs when price falls to the stop-loss level."""
-        if self.order_state == OrderState.PENDING:
-            return False
-        if self._order_lock.locked():
-            return False
+        """Disabled for Gabagool: paired inventory is the exit mechanism.
 
-        cfg = self.worker_config
-        inv = self.inventory
-
-        for side in ("YES", "NO"):
-            shares = inv.shares(side)
-            if shares < MIN_SHARES:
-                continue
-            entry = inv.avg_cost(side)
-            if entry <= 0:
-                continue
-            current = self.best_bid(side)
-            if current <= 0:
-                continue
-            if not stop_loss_triggered(current, entry, cfg.stop_loss_pct):
-                continue
-
-            stop_px = stop_loss_price(entry, cfg.stop_loss_pct)
-            print(
-                f"🛑 [STOP LOSS TRIGGER] {self.asset_type.upper()} {self.window_slug} | "
-                f"{side} entry={round(entry*100)}c current={round(current*100)}c "
-                f"stop={round(stop_px*100)}c (-{cfg.stop_loss_pct:.0%})"
-            )
-            async with self._order_lock:
-                if self.order_state != OrderState.IDLE:
-                    return True
-                self.order_state = OrderState.PENDING
-                try:
-                    await self._execute_stop_loss_sell(side, shares, entry)
-                finally:
-                    self.order_state = OrderState.IDLE
-            return True
+        A conventional single-leg stop would convert temporary unhedged
+        inventory into a directional loss and breaks the pair-arbitrage thesis.
+        The hard controls are max pair cost, max unpaired shares, minimum time
+        to resolution, order limits, and expiry settlement.
+        """
         return False
 
     def _update_momentum_dashboard(self) -> None:
@@ -3169,11 +3178,16 @@ class MarketWorker:
             self.dashboard["pair_avg_price_c"] = 0.0
         if inv.yes_shares > 0 or inv.no_shares > 0:
             self.dashboard["status"] = (
-                f"MOM Y{inv.yes_shares:.0f}/N{inv.no_shares:.0f}"
+                f"GAB Y{inv.yes_shares:.0f}/N{inv.no_shares:.0f}"
             )
         wc = self.worker_config
         self.dashboard["momentum_entry_threshold_c"] = round(wc.momentum_entry_threshold * 100)
-        self.dashboard["stop_loss_pct"] = wc.stop_loss_pct
+        self.dashboard["stop_loss_pct"] = 0.0
+        self.dashboard["gabagool_initial_entry_threshold_c"] = round(wc.gabagool_initial_entry_threshold * 100, 1)
+        self.dashboard["gabagool_max_pair_cost_c"] = round(wc.gabagool_max_pair_cost * 100, 1)
+        self.dashboard["gabagool_min_profit_margin_c"] = round(wc.gabagool_min_profit_margin * 100, 1)
+        self.dashboard["gabagool_max_unpaired_shares"] = wc.gabagool_max_unpaired_shares
+        self.dashboard["gabagool_min_time_to_resolution"] = wc.gabagool_min_time_to_resolution
         self.dashboard["entry_count"] = self.entry_count
         for side in ("YES", "NO"):
             shares = inv.shares(side)
@@ -3203,8 +3217,8 @@ class MarketWorker:
                 fill_parts.append(f"{side}={sz:.2f}@{round(px*100)}c")
         fill_str = " ".join(fill_parts) if fill_parts else "simulated"
         msg = (
-            f"[MOMENTUM {mode}] {decision.side} "
-            f"trigger={decision.trigger_price:.4f} size={decision.size} | {fill_str} | "
+            f"[GABAGOOL {mode}] {decision.side} "
+            f"ask={decision.trigger_price:.4f} reason={decision.reason} size={decision.size} | {fill_str} | "
             f"inv Y={inv.yes_shares:.1f} N={inv.no_shares:.1f}"
         )
         self.log_to_file(msg)
@@ -3228,15 +3242,40 @@ class MarketWorker:
         return order_id, 0.0
 
     def resolve_execution_legs(self, decision: MomentumDecision) -> List[Tuple[str, float]]:
-        """Re-read live bids at execution time so fills match the triggering prices."""
-        wc = self.worker_config
+        """Re-read the executable ask and preserve the pair-cost ceiling."""
+        cfg = self.worker_config
         side = decision.side
-        bid = self.best_bid(side)
-        if bid <= 0 or is_locked_price(bid):
+        ask = self.best_ask(side)
+        if ask <= 0 or is_locked_price(ask):
             return []
-        if bid < wc.momentum_entry_threshold:
+        if self.market_seconds_left() < cfg.gabagool_min_time_to_resolution:
             return []
-        return [(side, round(bid, 2))]
+
+        # The strategy already computed a safe 1-cent limit. Re-quote only if
+        # the live ask has not moved beyond that limit.
+        executable = math.ceil((ask - 1e-9) * 100.0) / 100.0
+        executable = round(executable, 2)
+        if executable > decision.price + 1e-9:
+            return []
+
+        inv = self.inventory
+        current = inv.shares(side)
+        other = "NO" if side == "YES" else "YES"
+        other_shares = inv.shares(other)
+        projected_unpaired = abs((current + decision.size) - other_shares)
+        if projected_unpaired > cfg.gabagool_max_unpaired_shares + 1e-9:
+            return []
+
+        if other_shares > MIN_FILL_DELTA:
+            current_avg = inv.avg_cost(side) if current > MIN_FILL_DELTA else 0.0
+            other_avg = inv.avg_cost(other)
+            projected_avg = (
+                (current * current_avg) + (decision.size * executable)
+            ) / max(current + decision.size, 1e-9)
+            if projected_avg + other_avg > cfg.gabagool_max_pair_cost + 1e-9:
+                return []
+
+        return [(side, executable)]
 
     @staticmethod
     def _extract_order_fill_price(info: Dict[str, Any], limit_price: float) -> float:
@@ -3509,7 +3548,7 @@ class MarketWorker:
     # ═════════════════════════════════════════════════════════════════════
 
     async def check_logic(self, timer: str):
-        """Momentum entry + stop-loss — evaluated every tick."""
+        """Gabagool paired-entry logic — evaluated on every market tick."""
         y = self.prices.get("YES", 0.0)
         n = self.prices.get("NO",  0.0)
         y_c = round(y * 100) if y > 0 else 0
@@ -3521,9 +3560,6 @@ class MarketWorker:
         self.update_dashboard()
 
         if y <= 0 or n <= 0:
-            return
-
-        if await self._check_stop_loss():
             return
 
         await self._check_momentum_logic(y_c, n_c)
@@ -3557,8 +3593,10 @@ class MarketWorker:
             if not self.can_enter():
                 return
             print(
-                f"[MOMENTUM] {self.asset_type.upper()} {self.window_slug} | "
-                f"{decision.side}@{round(decision.trigger_price*100)}c size={decision.size}"
+                f"[GABAGOOL] {self.asset_type.upper()} {self.window_slug} | "
+                f"{decision.side} ask={round(decision.trigger_price*100)}c "
+                f"size={decision.size} reason={decision.reason} "
+                f"pair={decision.projected_pair_cost:.4f}"
             )
             async with self._order_lock:
                 if self.order_state != OrderState.IDLE:
@@ -3566,13 +3604,15 @@ class MarketWorker:
                 await self.strategy.execute(self, decision)
             return
 
-        thr = self.worker_config.momentum_entry_threshold
+        cfg = self.worker_config
         inv = self.inventory
         print(
-            f"⏳ [IDLE] {self.asset_type.upper()} {self.window_slug} | "
-            f"YES={y_c}c NO={n_c}c | need>={round(thr*100)}c "
-            f"| inv Y={inv.yes_shares:.0f} N={inv.no_shares:.0f} "
-            f"entries={self.entry_count}"
+            f"⏳ [GABAGOOL IDLE] {self.asset_type.upper()} {self.window_slug} | "
+            f"YES ask={round(self.best_ask("YES")*100)}c "
+            f"NO ask={round(self.best_ask("NO")*100)}c | "
+            f"first<={round(cfg.gabagool_initial_entry_threshold*100)}c "
+            f"pair<={round(cfg.gabagool_max_pair_cost*100)}c | "
+            f"inv Y={inv.yes_shares:.0f} N={inv.no_shares:.0f} entries={self.entry_count}"
         )
 
     # ── Order execution ────────────────────────────────────────────────
@@ -3726,7 +3766,7 @@ class MarketWorker:
                 entry_price = round(inv.avg_cost("NO"), 4)
                 current_price = round(self.bids.get("NO", 0.0), 4)
         else:
-            display_side = "MOMENTUM"
+            display_side = "GABAGOOL"
             entry_price_cents = 0.0
             current_price_cents = 0.0
             entry_price = 0.0
@@ -3799,6 +3839,9 @@ class MarketWorker:
         self.dashboard["yes_avg_price_c"]   = 0.0
         self.dashboard["no_avg_price_c"]    = 0.0
         self.dashboard["pair_avg_price_c"]  = 0.0
+        self.dashboard["gabagool_initial_entry_threshold_c"] = round(self.worker_config.gabagool_initial_entry_threshold * 100, 1)
+        self.dashboard["gabagool_max_pair_cost_c"] = round(self.worker_config.gabagool_max_pair_cost * 100, 1)
+        self.dashboard["gabagool_min_profit_margin_c"] = round(self.worker_config.gabagool_min_profit_margin * 100, 1)
         self.dashboard["entry_count"]       = 0
         self.order_state = OrderState.IDLE
         self.inventory.reset()
@@ -3949,7 +3992,7 @@ class MarketWorker:
         return {
             "asset":              self.asset_type.upper(),
             "window":             self.window_slug,
-            "strategy":           "momentum",
+            "strategy":           "gabagool",
             "yes":                round(self.prices.get("YES", 0) * 100),
             "no":                 round(self.prices.get("NO",  0) * 100),
             "yes_bid_c":          self.dashboard.get("yes_bid_c", 0),
@@ -3957,7 +4000,15 @@ class MarketWorker:
             "combined_bid_c":     self.dashboard.get("combined_bid_c", 0),
             "momentum_entry_threshold": wc.momentum_entry_threshold,
             "momentum_entry_threshold_c": round(wc.momentum_entry_threshold * 100),
-            "stop_loss_pct":      wc.stop_loss_pct,
+            "stop_loss_pct":      0.0,
+            "gabagool_initial_entry_threshold": wc.gabagool_initial_entry_threshold,
+            "gabagool_initial_entry_threshold_c": round(wc.gabagool_initial_entry_threshold * 100, 1),
+            "gabagool_max_pair_cost": wc.gabagool_max_pair_cost,
+            "gabagool_max_pair_cost_c": round(wc.gabagool_max_pair_cost * 100, 1),
+            "gabagool_min_profit_margin": wc.gabagool_min_profit_margin,
+            "gabagool_min_profit_margin_c": round(wc.gabagool_min_profit_margin * 100, 1),
+            "gabagool_max_unpaired_shares": wc.gabagool_max_unpaired_shares,
+            "gabagool_min_time_to_resolution": wc.gabagool_min_time_to_resolution,
             "max_shares":         wc.max_shares,
             "yes_shares":         self.dashboard.get("yes_shares", 0.0),
             "no_shares":          self.dashboard.get("no_shares", 0.0),
@@ -4042,7 +4093,7 @@ class MarketWorker:
         price_in_cents = lambda p: f"{round(p * 100)}c"
 
         if inv.yes_shares <= MIN_FILL_DELTA and inv.no_shares <= MIN_FILL_DELTA:
-            print(f"\n{BOLD}{YELLOW}ℹ️  No momentum inventory this market "
+            print(f"\n{BOLD}{YELLOW}ℹ️  No Gabagool inventory this market "
                   f"({self.entry_count} entry attempts).{RESET}")
             self._finish_market_merge()
             return
@@ -4060,7 +4111,7 @@ class MarketWorker:
 
         actual_profit = round(settlement - total_cost, 4)
 
-        print(f"\n\n{BOLD}{GREEN}--- 📊 MOMENTUM SETTLEMENT ---{RESET}")
+        print(f"\n\n{BOLD}{GREEN}--- 📊 GABAGOOL SETTLEMENT ---{RESET}")
         print(f"⏱️ Market Outcome:      {outcome}")
         print(f"📦 Entries this round:  {self.entry_count}")
         print(f"📊 YES shares:          {inv.yes_shares:.4f} "
@@ -4080,7 +4131,7 @@ class MarketWorker:
         elif outcome == "NO" and no_unpaired > 0:
             self.log_trade("NO", 1.0, "redeem", size=no_unpaired)
 
-        self.log_pnl("MOMENTUM_SETTLE", actual_profit, {
+        self.log_pnl("GABAGOOL_SETTLE", actual_profit, {
             "outcome":          outcome,
             "yes_shares":       inv.yes_shares,
             "no_shares":        inv.no_shares,
@@ -4150,13 +4201,17 @@ class MarketWorker:
     async def start(self):
         """Per-worker trading loop for one (asset, window) pair."""
         wc = self.worker_config
-        print(f"🤖 EmilianoBot — MOMENTUM → "
+        print(f"🤖 EmilianoBot — GABAGOOL → "
               f"{self.asset_type.upper()} {self.window_slug} markets...")
         print(f"  Market interval   : {self.window_slug} ({wc.interval_seconds}s)")
         print(f"  Listener window   : final {wc.listener_activate_secs}s")
-        print(f"  Entry threshold   : {wc.momentum_entry_threshold:.2f} "
-              f"({wc.momentum_entry_threshold*100:.0f}c bid)")
-        print(f"  Stop loss         : {wc.stop_loss_pct:.0%} below entry")
+        print(f"  First-leg ceiling : {wc.gabagool_initial_entry_threshold:.3f} "
+              f"({wc.gabagool_initial_entry_threshold*100:.1f}c ask)")
+        print(f"  Pair-cost ceiling : {wc.gabagool_max_pair_cost:.3f} "
+              f"({wc.gabagool_max_pair_cost*100:.1f}c combined avg)")
+        print(f"  Min gross margin  : {wc.gabagool_min_profit_margin:.1%}")
+        print(f"  Max unpaired      : {wc.gabagool_max_unpaired_shares:.1f} shares")
+        print(f"  Min time to expiry: {wc.gabagool_min_time_to_resolution}s")
         if wc.random_order_size:
             order_size_label = (
                 f"{wc.order_size_min}-{wc.order_size_max} shares random "
@@ -4247,7 +4302,7 @@ def create_dashboard(bots):
     layout.split_column(
         Layout(
             Panel(
-                f"[bold cyan]EMILIANO BOT — Momentum[/bold cyan]\n"
+                f"[bold cyan]EMILIANO BOT — Gabagool[/bold cyan]\n"
                 f"Schedule ({_tz_label}): {_schedule_str}",
                 style="bold green", box=box.ROUNDED,
             ),
@@ -4271,13 +4326,13 @@ def create_dashboard(bots):
             rem = cd.get("cooldown_remaining_sec", 0)
             display_status = f"COOLDOWN {rem // 60}m{rem % 60:02d}s"
 
-        edge = d.get("momentum_entry_threshold_c", 0)
-        y_bid = d.get("yes_bid_c", 0)
-        n_bid = d.get("no_bid_c", 0)
-        stop_pct = d.get("stop_loss_pct", bot.worker_config.stop_loss_pct)
+        edge = d.get("gabagool_initial_entry_threshold_c", 0)
+        pair_max = d.get("gabagool_max_pair_cost_c", 0)
+        y_ask = d.get("yes", 0)
+        n_ask = d.get("no", 0)
         ratio_text = (
-            f"[cyan]entry >={edge:.0f}c[/cyan] "
-            f"(bids Y{y_bid}c N{n_bid}c | stop -{stop_pct:.0%})"
+            f"[cyan]first <= {edge:.1f}c[/cyan] "
+            f"(asks Y{y_ask}c N{n_ask}c | pair <= {pair_max:.1f}c)"
         )
         strategy_text = ""
 
@@ -4509,8 +4564,8 @@ if __name__ == "__main__":
     try:
         print("🚀 Starting EmilianoBot — Momentum...")
         for wc in WORKER_CONFIGS:
-            print(f"   {wc.asset.upper()} {wc.window}: entry>={wc.momentum_entry_threshold:.2f} "
-                  f"| stop={wc.stop_loss_pct:.0%} | order={wc.order_size} "
+            print(f"   {wc.asset.upper()} {wc.window}: first<={wc.gabagool_initial_entry_threshold:.3f} "
+                  f"| pair<={wc.gabagool_max_pair_cost:.3f} | order={wc.order_size} "
                   f"| max={wc.max_shares}/leg | dry_run={wc.dry_run}")
         asyncio.run(main())
     except KeyboardInterrupt:

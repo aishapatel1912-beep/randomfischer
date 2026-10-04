@@ -1,56 +1,177 @@
-"""Momentum — buy YES or NO when its bid is at/above the entry threshold."""
+"""Gabagool-style paired accumulation for Polymarket crypto UP/DOWN markets.
+
+The strategy is deliberately non-directional:
+  1. Start with whichever side is temporarily cheap.
+  2. After the first fill, seek the opposite side.
+  3. Every new fill must keep the weighted-average YES + NO pair cost below
+     the configured ceiling.
+  4. Prefer the under-hedged side so inventory stays close to delta-neutral.
+  5. Never use the old 90c directional momentum entry rule.
+
+This is a public-mechanics approximation of the Gabagool-style method; it is
+not a claim to reproduce any private Gabagool22 source code.
+"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+import math
+from typing import TYPE_CHECKING, Optional, Tuple
 
-from strategies.base import MomentumDecision
+from strategies.base import GabagoolDecision
 from strategies.momentum_execution import execute_momentum_decision
-from utils.momentum_risk import is_market_locked, pick_momentum_side
+from utils.momentum_risk import is_market_locked
 
 if TYPE_CHECKING:
     from bot import MarketWorker
 
 
-class MomentumStrategy:
-    async def evaluate(self, worker: "MarketWorker") -> Optional[MomentumDecision]:
+_EPS = 1e-9
+
+
+class GabagoolStrategy:
+    @staticmethod
+    def _leg(worker: "MarketWorker", side: str) -> Tuple[float, float]:
+        """Return (shares, weighted average entry) for one token."""
+        inv = worker.inventory
+        return float(inv.shares(side)), float(inv.avg_cost(side))
+
+    @staticmethod
+    def _select_first_side(
+        yes_ask: float,
+        no_ask: float,
+        threshold: float,
+    ) -> Optional[Tuple[str, float]]:
+        candidates = []
+        if 0 < yes_ask <= threshold + _EPS:
+            candidates.append(("YES", yes_ask))
+        if 0 < no_ask <= threshold + _EPS:
+            candidates.append(("NO", no_ask))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda x: x[1])
+
+    @staticmethod
+    def _round_up_tick(price: float) -> float:
+        """Round a buy limit upward to Polymarket's 1-cent tick."""
+        return math.ceil((price - _EPS) * 100.0) / 100.0
+
+    async def evaluate(self, worker: "MarketWorker") -> Optional[GabagoolDecision]:
         from bot import OrderState, is_locked_price
 
         if worker.order_state == OrderState.PENDING:
             return None
-
-        cfg = worker.worker_config
-        yes_bid = worker.best_bid("YES")
-        no_bid = worker.best_bid("NO")
-
-        if is_market_locked(yes_bid, no_bid, is_locked=is_locked_price):
-            worker.log_locked_market_skip(yes_bid, no_bid)
+        if worker._order_lock.locked():
             return None
-
-        picked = pick_momentum_side(
-            yes_bid,
-            no_bid,
-            cfg.momentum_entry_threshold,
-            is_locked=is_locked_price,
-        )
-        if picked is None:
+        if not worker.active_market:
             return None
-
-        side, bid = picked
-
         if not worker.can_enter():
             return None
 
-        size = worker.entry_order_size([side])
-        if size is None:
+        cfg = worker.worker_config
+        seconds_left = worker.market_seconds_left()
+        if seconds_left < cfg.gabagool_min_time_to_resolution:
             return None
 
-        return MomentumDecision(
+        yes_ask = worker.best_ask("YES")
+        no_ask = worker.best_ask("NO")
+        if is_market_locked(yes_ask, no_ask, is_locked=is_locked_price):
+            worker.log_locked_market_skip(yes_ask, no_ask)
+            return None
+        if yes_ask <= 0 or no_ask <= 0:
+            return None
+
+        yes_shares, yes_avg = self._leg(worker, "YES")
+        no_shares, no_avg = self._leg(worker, "NO")
+
+        # First leg: buy the cheaper side only when it is genuinely cheap.
+        if yes_shares <= _EPS and no_shares <= _EPS:
+            picked = self._select_first_side(
+                yes_ask,
+                no_ask,
+                cfg.gabagool_initial_entry_threshold,
+            )
+            if picked is None:
+                return None
+            side, ask = picked
+            first_leg = True
+            opposite_avg = 0.0
+            opposite_shares = 0.0
+            target_price = cfg.gabagool_initial_entry_threshold
+            reason = "first_cheap_leg"
+        else:
+            first_leg = False
+
+            # Strictly hedge the side with fewer shares.  If already balanced,
+            # add to whichever side offers the better executable price.
+            if yes_shares > no_shares + _EPS:
+                side = "NO"
+            elif no_shares > yes_shares + _EPS:
+                side = "YES"
+            else:
+                side = "YES" if yes_ask <= no_ask else "NO"
+
+            ask = yes_ask if side == "YES" else no_ask
+            opposite = "NO" if side == "YES" else "YES"
+            opposite_shares, opposite_avg = self._leg(worker, opposite)
+
+            # With an existing opposite leg, this is the maximum price that
+            # keeps the final weighted pair cost under the ceiling.
+            if opposite_shares <= _EPS or opposite_avg <= 0:
+                target_price = cfg.gabagool_initial_entry_threshold
+            else:
+                target_price = cfg.gabagool_max_pair_cost - opposite_avg
+
+            reason = "hedge_underweight" if yes_shares != no_shares else "balanced_cheap_leg"
+
+        if target_price <= 0 or ask <= 0:
+            return None
+
+        size = worker.entry_order_size([side])
+        if size is None or size <= 0:
+            return None
+
+        # Respect the configured unpaired inventory ceiling.  This is the
+        # principal risk control while waiting for the opposite side.
+        current_shares = yes_shares if side == "YES" else no_shares
+        other_shares = no_shares if side == "YES" else yes_shares
+        projected_unpaired = abs((current_shares + size) - other_shares)
+        if projected_unpaired > cfg.gabagool_max_unpaired_shares + _EPS:
+            return None
+
+        # Calculate the minimum 1-cent executable limit. If the ask cannot be
+        # bought at a whole-cent price without breaking the pair-cost ceiling,
+        # wait for the book to improve rather than overpaying.
+        executable_price = self._round_up_tick(ask + cfg.gabagool_price_buffer)
+        executable_price = min(executable_price, target_price)
+        executable_price = round(executable_price, 2)
+        if executable_price + _EPS < ask:
+            return None
+
+        current_shares, current_avg = self._leg(worker, side)
+        projected_avg = (
+            (current_shares * current_avg) + (size * executable_price)
+        ) / max(current_shares + size, _EPS)
+
+        if opposite_shares > _EPS and opposite_avg > 0:
+            projected_pair_cost = projected_avg + opposite_avg
+            if projected_pair_cost > cfg.gabagool_max_pair_cost + _EPS:
+                return None
+        else:
+            projected_pair_cost = 0.0
+
+        return GabagoolDecision(
             side=side,
-            price=round(bid, 2),
+            price=executable_price,
             size=size,
-            trigger_price=round(bid, 4),
+            trigger_price=ask,
+            reason=reason,
+            projected_pair_cost=round(projected_pair_cost, 6),
+            first_leg=first_leg,
         )
 
-    async def execute(self, worker: "MarketWorker", decision: MomentumDecision) -> None:
+    async def execute(self, worker: "MarketWorker", decision: GabagoolDecision) -> None:
         await execute_momentum_decision(worker, decision)
+
+
+# Compatibility name used by bot.py.
+MomentumStrategy = GabagoolStrategy

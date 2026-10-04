@@ -156,6 +156,12 @@ def _app_config_payload() -> dict:
         "trading_assets_label":     trading_assets_label(),
         "asset_max_cumulative_loss": ASSET_MAX_CUMULATIVE_LOSS,
         "asset_cooldown_minutes":   ASSET_COOLDOWN_MINUTES,
+        "strategy":                 "gabagool",
+        "gabagool": {
+            "initial_entry_threshold": min((w.gabagool_initial_entry_threshold for w in WORKER_CONFIGS), default=0.49),
+            "max_pair_cost": min((w.gabagool_max_pair_cost for w in WORKER_CONFIGS), default=0.98),
+            "min_profit_margin": min((w.gabagool_min_profit_margin for w in WORKER_CONFIGS), default=0.02),
+        },
     }
 
 
@@ -2117,13 +2123,13 @@ function renderCard(bot){
   const cdPnl=Number(bot.cooldown_window_pnl)||0;
   const cdPnlPos=cdPnl>=0;
   const border=inProfit?'border-l-4 border-l-accent':inLoss?'border-l-4 border-red-500':inCooldown?'border-l-4 border-orange-500':hasPos?'border-l-4 border-sky-500':'';
-  const entryThrC=bot.momentum_entry_threshold_c??90;
-  const stopPct=Math.round((bot.stop_loss_pct??0.35)*100);
-  const yesAboveEntry=(bot.yes||0)>=entryThrC;
-  const noAboveEntry=(bot.no||0)>=entryThrC;
-  const signal=yesAboveEntry||noAboveEntry?`MOM ≥${entryThrC}c`:'WAITING';
-  const yesStopC=(bot.yes_shares||0)>0?(bot.yes_stop_c||0):null;
-  const noStopC=(bot.no_shares||0)>0?(bot.no_stop_c||0):null;
+  const firstEntryC=bot.gabagool_initial_entry_threshold_c??49;
+  const pairMaxC=bot.gabagool_max_pair_cost_c??98;
+  const pairAvgCValue=(bot.pair_avg_price_c||0);
+  const hasPair=(bot.yes_shares||0)>0&&(bot.no_shares||0)>0;
+  const signal=hasPair?`PAIR ${pairAvgCValue.toFixed(1)}c`:((bot.yes||0)<=firstEntryC||(bot.no||0)<=firstEntryC)?`BUY ≤${firstEntryC}c`:'HUNTING';
+  const yesStopC=null;
+  const noStopC=null;
   const yesAvgC=(bot.yes_shares||0)>0?(bot.yes_avg_price_c||0):null;
   const noAvgC=(bot.no_shares||0)>0?(bot.no_avg_price_c||0):null;
   const yesShLabel=(bot.yes_shares||0)>0
@@ -2132,7 +2138,7 @@ function renderCard(bot){
   const noShLabel=(bot.no_shares||0)>0
     ?`NO ${(bot.no_shares||0).toFixed(1)} sh avg @ ${noAvgC.toFixed(1)}c`
     :`NO 0 / ${(bot.max_shares||'?')}`;
-  const pairAvgC=null;
+  const pairAvgC=hasPair?pairAvgCValue:null;
   const wins=bot.wins??0;const losses=bot.losses??0;
   const trades=bot.trade_count??0;const wr=bot.win_rate??0;
   const mw=formatMarketWindow(bot.market_start_iso,bot.market_end_iso);
@@ -2177,8 +2183,8 @@ function renderCard(bot){
           ${sigIcon(signal)} ${signal}
         </span>
         <div class="text-xs text-zinc-400 font-mono">
-          entry <span class="text-cyan-400">≥${entryThrC}c</span>
-          &nbsp;· stop <span class="text-orange-400">-${stopPct}%</span>
+          first leg <span class="text-cyan-400">≤${firstEntryC}c</span>
+          &nbsp;· pair max <span class="text-orange-400">${pairMaxC}c</span>
         </div>
       </div>
       <div class="bg-zinc-800/60 rounded-xl px-3 py-2 mb-3 text-xs font-mono text-zinc-300 grid grid-cols-2 gap-x-3 gap-y-1">
@@ -2558,7 +2564,7 @@ async def api_trades_history(limit: int = 10):
 async def api_cashout(asset: str, window: str):
     raise HTTPException(
         status_code=410,
-        detail="Manual cashout removed — momentum strategy uses stop-loss and expiry settlement",
+        detail="Manual cashout removed — Gabagool strategy pairs YES/NO and settles at expiry",
     )
 
 
@@ -2566,7 +2572,7 @@ async def api_cashout(asset: str, window: str):
 async def api_cashout_legacy(asset: str):
     raise HTTPException(
         status_code=410,
-        detail="Manual cashout removed — momentum strategy uses stop-loss and expiry settlement",
+        detail="Manual cashout removed — Gabagool strategy pairs YES/NO and settles at expiry",
     )
 
 

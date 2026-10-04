@@ -157,13 +157,20 @@ def _cfg_get(raw: dict, defaults: dict, *keys: str, default: Any = None) -> Any:
 class WorkerConfig:
     asset: str
     window: str
+    # Legacy fields kept for dashboard/backward compatibility. Gabagool does not use them for entries/exits.
     momentum_entry_threshold: float = 0.90
     stop_loss_pct: float = 0.35
+    gabagool_initial_entry_threshold: float = 0.49
+    gabagool_max_pair_cost: float = 0.98
+    gabagool_min_profit_margin: float = 0.02
+    gabagool_max_unpaired_shares: float = 5.0
+    gabagool_min_time_to_resolution: int = 60
+    gabagool_price_buffer: float = 0.00
     trade_cooldown_ms: int = 3000
-    order_size_min: float = 10.0
-    order_size_max: float = 10.0
-    max_order_size: float = 10.0
-    max_shares: float = 10.2
+    order_size_min: float = 5.0
+    order_size_max: float = 5.0
+    max_order_size: float = 5.0
+    max_shares: float = 20.0
     dry_run: bool = DRY_RUN_DEFAULT
     dry_run_fill_delay_min_ms: int = 200
     dry_run_fill_delay_max_ms: int = 2500
@@ -225,6 +232,44 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     env_stop = os.getenv("STOP_LOSS_PCT", "").strip()
     if env_stop:
         stop_loss_pct = _parse_unit_fraction("STOP_LOSS_PCT", env_stop, stop_loss_pct)
+    gabagool_initial_entry_threshold = _parse_unit_fraction(
+        "gabagool_initial_entry_threshold",
+        _cfg_get(raw, defaults, "gabagool_initial_entry_threshold"),
+        float(defaults.get("gabagool_initial_entry_threshold", 0.49)),
+    )
+    gabagool_max_pair_cost = _parse_unit_fraction(
+        "gabagool_max_pair_cost",
+        _cfg_get(raw, defaults, "gabagool_max_pair_cost"),
+        float(defaults.get("gabagool_max_pair_cost", 0.98)),
+    )
+    gabagool_min_profit_margin = _parse_unit_fraction(
+        "gabagool_min_profit_margin",
+        _cfg_get(raw, defaults, "gabagool_min_profit_margin"),
+        float(defaults.get("gabagool_min_profit_margin", 0.02)),
+    )
+    gabagool_max_unpaired_shares = _parse_max_shares(
+        "gabagool_max_unpaired_shares",
+        _cfg_get(raw, defaults, "gabagool_max_unpaired_shares"),
+        float(defaults.get("gabagool_max_unpaired_shares", 5.0)),
+    )
+    gabagool_min_time_to_resolution = int(
+        _cfg_get(raw, defaults, "gabagool_min_time_to_resolution", default=60)
+    )
+    gabagool_price_buffer = float(
+        _cfg_get(raw, defaults, "gabagool_price_buffer", default=0.0)
+    )
+    if gabagool_min_time_to_resolution < 0:
+        _fatal(f"{asset}:{window}: gabagool_min_time_to_resolution must be >= 0")
+    if gabagool_price_buffer < 0 or gabagool_price_buffer > 0.05:
+        _fatal(f"{asset}:{window}: gabagool_price_buffer must be between 0 and 0.05")
+    if gabagool_min_profit_margin >= 1:
+        _fatal(f"{asset}:{window}: gabagool_min_profit_margin must be < 1")
+    if gabagool_max_pair_cost > 1.0 - gabagool_min_profit_margin + 1e-9:
+        _fatal(
+            f"{asset}:{window}: gabagool_max_pair_cost={gabagool_max_pair_cost} "
+            f"must be <= 1 - gabagool_min_profit_margin={1.0 - gabagool_min_profit_margin:.4f}"
+        )
+
     trade_cooldown_ms = _parse_cooldown_ms(
         "trade_cooldown_ms",
         _cfg_get(raw, defaults, "trade_cooldown_ms"),
@@ -234,7 +279,7 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     order_size_fixed = _parse_order_size(
         "order_size",
         _cfg_get(raw, defaults, "order_size", "spread_size"),
-        float(_cfg_get(defaults, {}, "order_size", "spread_size", default=10.0)),
+        float(_cfg_get(defaults, {}, "order_size", "spread_size", default=5.0)),
     )
     size_min_raw = _cfg_get(raw, defaults, "order_size_min", "spread_size_min")
     size_max_raw = _cfg_get(raw, defaults, "order_size_max", "spread_size_max")
@@ -254,12 +299,12 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     max_order = _parse_order_size(
         "max_order_size",
         _cfg_get(raw, defaults, "max_order_size"),
-        float(defaults.get("max_order_size", 10.0)),
+        float(defaults.get("max_order_size", 5.0)),
     )
     max_shares = _parse_max_shares(
         "max_shares",
         _cfg_get(raw, defaults, "max_shares"),
-        float(defaults.get("max_shares", 10.2)),
+        float(defaults.get("max_shares", 20.0)),
     )
 
     if ENV_SIZING_OVERRIDES:
@@ -350,6 +395,12 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         window=window,
         momentum_entry_threshold=momentum_entry_threshold,
         stop_loss_pct=stop_loss_pct,
+        gabagool_initial_entry_threshold=gabagool_initial_entry_threshold,
+        gabagool_max_pair_cost=gabagool_max_pair_cost,
+        gabagool_min_profit_margin=gabagool_min_profit_margin,
+        gabagool_max_unpaired_shares=gabagool_max_unpaired_shares,
+        gabagool_min_time_to_resolution=gabagool_min_time_to_resolution,
+        gabagool_price_buffer=gabagool_price_buffer,
         trade_cooldown_ms=trade_cooldown_ms,
         order_size_min=order_size_min,
         order_size_max=order_size_max,
