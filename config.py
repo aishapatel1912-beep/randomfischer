@@ -203,6 +203,27 @@ class WorkerConfig:
     gabagool_falling_knife_recovery_cents: float = 1.5
     gabagool_falling_knife_cooldown_seconds: float = 5.0
     gabagool_falling_knife_binance_confirm: float = 0.10
+
+    # Arbigab-style three-engine architecture
+    momentum_engine_enabled: bool = True
+    momentum_min_delta: float = 0.0015
+    momentum_signal_max_age: float = 0.75
+    momentum_execution_mode: str = "single_taker"
+    momentum_max_position_delta: float = 5.0
+    market_making_enabled: bool = True
+    market_making_quote_size: float = 5.0
+    market_making_min_spread: float = 0.02
+    market_making_quote_offset: float = 0.01
+    market_making_max_position_delta: float = 5.0
+    market_making_requote_seconds: float = 0.40
+    spread_capture_enabled: bool = True
+    spread_capture_trigger_sum: float = 0.995
+    spread_capture_max_entry_sum: float = 0.985
+    spread_capture_max_unpaired: float = 1.0
+    preemptive_cancel_enabled: bool = True
+    preemptive_cancel_imbalance: float = 0.18
+    preemptive_cancel_momentum: float = 0.10
+    preemptive_cancel_price_delta: float = 0.0015
     trade_cooldown_ms: int = 3000
     order_size_min: float = 5.0
     order_size_max: float = 5.0
@@ -410,6 +431,28 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
             f"must be <= 1 - gabagool_min_profit_margin={1.0 - gabagool_min_profit_margin:.4f}"
         )
 
+    momentum_engine_enabled = _parse_bool_value("momentum_engine_enabled", _cfg_get(raw, defaults, "momentum_engine_enabled", default=True), True)
+    momentum_min_delta = _parse_nonnegative_float("momentum_min_delta", _cfg_get(raw, defaults, "momentum_min_delta", default=0.0015), 0.0015)
+    momentum_signal_max_age = _parse_nonnegative_float("momentum_signal_max_age", _cfg_get(raw, defaults, "momentum_signal_max_age", default=0.75), 0.75)
+    momentum_execution_mode = str(_cfg_get(raw, defaults, "momentum_execution_mode", default="single_taker")).strip().lower()
+    if momentum_execution_mode not in {"single_taker", "gtc_at_ask", "single_maker", "dual_hybrid"}:
+        _fatal(f"{asset}:{window}: unsupported momentum_execution_mode={momentum_execution_mode!r}")
+    momentum_max_position_delta = _parse_nonnegative_float("momentum_max_position_delta", _cfg_get(raw, defaults, "momentum_max_position_delta", default=5.0), 5.0)
+    market_making_enabled = _parse_bool_value("market_making_enabled", _cfg_get(raw, defaults, "market_making_enabled", default=True), True)
+    market_making_quote_size = _parse_order_size("market_making_quote_size", _cfg_get(raw, defaults, "market_making_quote_size", default=5.0), 5.0)
+    market_making_min_spread = _parse_nonnegative_float("market_making_min_spread", _cfg_get(raw, defaults, "market_making_min_spread", default=0.02), 0.02)
+    market_making_quote_offset = _parse_nonnegative_float("market_making_quote_offset", _cfg_get(raw, defaults, "market_making_quote_offset", default=0.01), 0.01)
+    market_making_max_position_delta = _parse_nonnegative_float("market_making_max_position_delta", _cfg_get(raw, defaults, "market_making_max_position_delta", default=5.0), 5.0)
+    market_making_requote_seconds = _parse_nonnegative_float("market_making_requote_seconds", _cfg_get(raw, defaults, "market_making_requote_seconds", default=0.40), 0.40)
+    spread_capture_enabled = _parse_bool_value("spread_capture_enabled", _cfg_get(raw, defaults, "spread_capture_enabled", default=True), True)
+    spread_capture_trigger_sum = _parse_nonnegative_float("spread_capture_trigger_sum", _cfg_get(raw, defaults, "spread_capture_trigger_sum", default=0.995), 0.995)
+    spread_capture_max_entry_sum = _parse_nonnegative_float("spread_capture_max_entry_sum", _cfg_get(raw, defaults, "spread_capture_max_entry_sum", default=0.985), 0.985)
+    spread_capture_max_unpaired = _parse_nonnegative_float("spread_capture_max_unpaired", _cfg_get(raw, defaults, "spread_capture_max_unpaired", default=1.0), 1.0)
+    preemptive_cancel_enabled = _parse_bool_value("preemptive_cancel_enabled", _cfg_get(raw, defaults, "preemptive_cancel_enabled", default=True), True)
+    preemptive_cancel_imbalance = _parse_nonnegative_float("preemptive_cancel_imbalance", _cfg_get(raw, defaults, "preemptive_cancel_imbalance", default=0.18), 0.18)
+    preemptive_cancel_momentum = _parse_nonnegative_float("preemptive_cancel_momentum", _cfg_get(raw, defaults, "preemptive_cancel_momentum", default=0.10), 0.10)
+    preemptive_cancel_price_delta = _parse_nonnegative_float("preemptive_cancel_price_delta", _cfg_get(raw, defaults, "preemptive_cancel_price_delta", default=0.0015), 0.0015)
+
     trade_cooldown_ms = _parse_cooldown_ms(
         "trade_cooldown_ms",
         _cfg_get(raw, defaults, "trade_cooldown_ms"),
@@ -556,6 +599,25 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         gabagool_falling_knife_recovery_cents=gabagool_falling_knife_recovery_cents,
         gabagool_falling_knife_cooldown_seconds=gabagool_falling_knife_cooldown_seconds,
         gabagool_falling_knife_binance_confirm=gabagool_falling_knife_binance_confirm,
+        momentum_engine_enabled=momentum_engine_enabled,
+        momentum_min_delta=momentum_min_delta,
+        momentum_signal_max_age=momentum_signal_max_age,
+        momentum_execution_mode=momentum_execution_mode,
+        momentum_max_position_delta=momentum_max_position_delta,
+        market_making_enabled=market_making_enabled,
+        market_making_quote_size=market_making_quote_size,
+        market_making_min_spread=market_making_min_spread,
+        market_making_quote_offset=market_making_quote_offset,
+        market_making_max_position_delta=market_making_max_position_delta,
+        market_making_requote_seconds=market_making_requote_seconds,
+        spread_capture_enabled=spread_capture_enabled,
+        spread_capture_trigger_sum=spread_capture_trigger_sum,
+        spread_capture_max_entry_sum=spread_capture_max_entry_sum,
+        spread_capture_max_unpaired=spread_capture_max_unpaired,
+        preemptive_cancel_enabled=preemptive_cancel_enabled,
+        preemptive_cancel_imbalance=preemptive_cancel_imbalance,
+        preemptive_cancel_momentum=preemptive_cancel_momentum,
+        preemptive_cancel_price_delta=preemptive_cancel_price_delta,
         trade_cooldown_ms=trade_cooldown_ms,
         order_size_min=order_size_min,
         order_size_max=order_size_max,

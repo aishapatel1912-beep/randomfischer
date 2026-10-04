@@ -50,6 +50,7 @@ from config import (
 )
 from strategies.base import MomentumDecision
 from strategies.momentum import MomentumStrategy
+from strategies.arbigab_engines import ArbigabEngineRouter, economic_position
 from utils.momentum_inventory import PositionInventory
 from utils.momentum_risk import (
     entry_window_ok,
@@ -2152,6 +2153,10 @@ class BinanceDepthSignal:
         self.momentum    = 0.0
         self.last_update = 0.0
         self._history: deque = deque(maxlen=8)
+        self._price_history: deque = deque(maxlen=128)
+        self.last_trade_price = 0.0
+        self.last_trade_time = 0.0
+        self.price_delta = 0.0
         self._running    = False
 
     @property
@@ -2172,19 +2177,52 @@ class BinanceDepthSignal:
             return "MILDLY BULL ↑"   if self.imbalance > 0 else "MILDLY BEAR ↓"
         return "NEUTRAL"
 
+    @property
+    def price_ready(self) -> bool:
+        return self.last_trade_price > 0 and len(self._price_history) >= 2
+
+    @property
+    def age_seconds(self) -> float:
+        return max(0.0, t.time() - self.last_trade_time) if self.last_trade_time else 999.0
+
     async def _run(self):
         if self._running:
             return
         self._running = True
-        stream = f"{self.symbol.lower()}usdt@depth{BINANCE_DEPTH_LIMIT}@100ms"
-        url    = f"wss://fstream.binance.com/stream?streams={stream}"
+        depth_stream = f"{self.symbol.lower()}usdt@depth{BINANCE_DEPTH_LIMIT}@100ms"
+        trade_stream = f"{self.symbol.lower()}usdt@aggTrade"
+        url    = f"wss://stream.binance.com:9443/stream?streams={depth_stream}/{trade_stream}"
         while True:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=15) as ws:
-                    print(f"📡 [Binance WS] Connected: {stream}")
+                    print(f"📡 [Binance WS] Connected: {depth_stream} + {trade_stream}")
                     async for raw in ws:
                         msg  = json.loads(raw)
                         data = msg.get("data", msg)
+                        event_type = data.get("e")
+                        if event_type == "aggTrade":
+                            try:
+                                px = float(data.get("p", 0.0))
+                            except (TypeError, ValueError):
+                                px = 0.0
+                            if px > 0:
+                                now = t.time()
+                                self.last_trade_price = px
+                                self.last_trade_time = now
+                                self._price_history.append((now, px))
+                                lookback = max(0.10, float(os.getenv("BINANCE_MOMENTUM_LOOKBACK", "1.0")))
+                                cutoff = now - lookback
+                                while self._price_history and self._price_history[0][0] < cutoff:
+                                    self._price_history.popleft()
+                                if self._price_history:
+                                    base = self._price_history[0][1]
+                                    self.price_delta = (px - base) / base if base else 0.0
+                                # Event-driven wakeup: the strategy router can react to
+                                # Binance aggTrade without waiting for a Polymarket tick.
+                                with _worker_registry_lock:
+                                    targets = [w for w in _worker_registry if w.asset_type == self.symbol.lower()]
+                                for worker in targets:
+                                    asyncio.create_task(worker.on_binance_tick())
                         bids = data.get("b", [])
                         asks = data.get("a", [])
                         if bids and asks:
@@ -2738,6 +2776,11 @@ class MarketWorker:
         self.seen_markets = set()
 
         self._order_lock = asyncio.Lock()
+        self._binance_eval_lock = asyncio.Lock()
+        self.engine_router = ArbigabEngineRouter()
+        self._engine_orders: Dict[str, Tuple[str, float, float, str, str]] = {}
+        self._engine_fills: Dict[str, float] = {}
+        self._last_mm_quote = 0.0
 
         label = f"{self.asset_type.upper()} {self.window_slug}"
         self.dashboard = {
@@ -2777,6 +2820,16 @@ class MarketWorker:
             "falling_knife_side": "-",
             "falling_knife_drop_c": 0.0,
             "entry_count":        0,
+            "engine":             "idle",
+            "preemptive_cancel_active": False,
+            "preemptive_cancel_side": "-",
+            "position_delta":      0.0,
+            "pnl_if_up":            0.0,
+            "pnl_if_down":          0.0,
+            "mark_pnl":             0.0,
+            "invested":             0.0,
+            "locked_profit":        0.0,
+            "matched_pairs":        0.0,
         }
         self.recent_logs: Deque[str] = deque(maxlen=4)
 
@@ -3825,6 +3878,19 @@ class MarketWorker:
     # CORE ENTRY LOGIC — SINGLE-LEG DIRECTIONAL
     # ═════════════════════════════════════════════════════════════════════
 
+    async def on_binance_tick(self) -> None:
+        if not self.active_market or self.prices.get("YES", 0.0) <= 0 or self.prices.get("NO", 0.0) <= 0:
+            return
+        if self._binance_eval_lock.locked():
+            return
+        async with self._binance_eval_lock:
+            try:
+                self._update_economic_dashboard()
+                await self.engine_router.on_tick(self)
+                self._update_economic_dashboard()
+            except Exception as exc:
+                print(f"⚠️ [BINANCE ENGINE] {self.asset_type.upper()} {self.window_slug}: {exc}")
+
     async def check_logic(self, timer: str):
         """Gabagool paired-entry logic — evaluated on every market tick."""
         y = self.prices.get("YES", 0.0)
@@ -3846,7 +3912,148 @@ class MarketWorker:
         self.dashboard["falling_knife_blocked"] = False
         self.dashboard["falling_knife_side"] = "-"
 
-        await self._check_momentum_logic(y_c, n_c)
+        # Economic position is updated before every engine decision.
+        self._update_economic_dashboard()
+        await self.engine_router.on_tick(self)
+        self._update_economic_dashboard()
+        self.update_dashboard()
+
+    def binance_signal(self):
+        symbol = self.asset_type.upper()
+        return BinanceDepthSignal._instances.get(symbol)
+
+    def min_fill_delta(self) -> float:
+        return MIN_FILL_DELTA
+
+    def engine_order_size(self, side: str) -> float:
+        room = self.inventory.headroom(side, self.worker_config.max_shares)
+        if room < MIN_FILL_DELTA:
+            return 0.0
+        target = min(float(self.worker_config.order_size_max), float(self.worker_config.max_order_size), room)
+        return round(target, 4) if target >= MIN_SHARES else 0.0
+
+    def _update_economic_dashboard(self) -> None:
+        pos = economic_position(self)
+        self.dashboard.update({
+            "position_delta": round(pos.position_delta, 4),
+            "pnl_if_up": round(pos.pnl_if_yes, 4),
+            "pnl_if_down": round(pos.pnl_if_no, 4),
+            "mark_pnl": round(pos.mark_pnl, 4),
+            "invested": round(pos.invested, 4),
+            "locked_profit": round(pos.locked_profit, 4),
+            "matched_pairs": round(pos.matched_pairs, 4),
+            "engine_position_delta": round(pos.position_delta, 4),
+        })
+
+    def track_engine_order(self, order_id: str, side: str, size: float, price: float, action: str, engine: str) -> None:
+        self._engine_orders[order_id] = (side, float(size), float(price), action.upper(), engine)
+
+    async def cancel_engine_orders(self, side: Optional[str] = None) -> int:
+        count = 0
+        for oid, (oside, size, price, action, engine) in list(self._engine_orders.items()):
+            if side is not None and oside != side:
+                continue
+            try:
+                if oid != "dry-run":
+                    await self.cancel_order_confirmed(oid, size, price)
+                self._engine_orders.pop(oid, None)
+                count += 1
+            except Exception as exc:
+                print(f"⚠️ [ENGINE CANCEL] {oid}: {exc}")
+        return count
+
+    async def refresh_market_maker_quotes(self) -> bool:
+        cfg = self.worker_config
+        now = t.time()
+        if now - self._last_mm_quote < cfg.market_making_requote_seconds:
+            await self.poll_engine_orders()
+            return False
+        if self.is_dry_run():
+            pos = economic_position(self)
+            print(
+                f"🧪 [MM QUOTE] {self.asset_type.upper()} {self.window_slug} | "
+                f"Y {self.best_bid('YES'):.3f}/{self.best_ask('YES'):.3f} "
+                f"N {self.best_bid('NO'):.3f}/{self.best_ask('NO'):.3f} | "
+                f"Δ={pos.position_delta:+.2f} PnL(U/D)={pos.pnl_if_yes:+.3f}/{pos.pnl_if_no:+.3f}"
+            )
+            self._last_mm_quote = now
+            return False
+        await self.poll_engine_orders()
+        if self.engine_router.cancel.exposed_side(self):
+            return False
+        changed = False
+        for side in ("YES", "NO"):
+            bid, ask = self.best_bid(side), self.best_ask(side)
+            if bid <= 0 or ask <= 0 or ask - bid < cfg.market_making_min_spread:
+                continue
+            if abs(economic_position(self).position_delta) >= cfg.market_making_max_position_delta:
+                # Only quote the underweight side when inventory is skewed.
+                pos = economic_position(self)
+                if (side == "YES" and pos.position_delta > 0) or (side == "NO" and pos.position_delta < 0):
+                    continue
+            quote_size = min(cfg.market_making_quote_size, self.engine_order_size(side))
+            if quote_size < MIN_SHARES:
+                continue
+            buy_px = min(ask - 0.01, bid + cfg.market_making_quote_offset)
+            buy_px = round(max(0.01, min(buy_px, ask - 0.01)), 2)
+            if buy_px <= 0 or buy_px >= ask:
+                continue
+            # Do not duplicate an existing MM buy quote for the same token.
+            if not any(v[0] == side and v[3] == "BUY" and v[4] == "market_making" for v in self._engine_orders.values()):
+                ok, oid, filled = await self.place_order_raw(side, buy_px, quote_size, order_type="GTC", action="BUY")
+                if ok and oid and oid != "dry-run":
+                    self.track_engine_order(oid, side, quote_size, buy_px, "BUY", "market_making")
+                if filled or oid == "dry-run":
+                    self.inventory.record_buy(side, quote_size, buy_px)
+                changed = changed or ok
+            # If inventory exists, also expose a resting offer to recycle risk.
+            held = self.inventory.shares(side)
+            sell_size = min(held, cfg.market_making_quote_size, cfg.max_order_size)
+            if sell_size >= MIN_SHARES and not any(v[0] == side and v[3] == "SELL" and v[4] == "market_making" for v in self._engine_orders.values()):
+                sell_px = round(max(0.01, min(0.99, ask)), 2)
+                ok, oid, filled = await self.place_order_raw(side, sell_px, sell_size, order_type="GTC", action="SELL")
+                if ok and oid and oid != "dry-run":
+                    self.track_engine_order(oid, side, sell_size, sell_px, "SELL", "market_making")
+                if filled or oid == "dry-run":
+                    self.inventory.record_sell(side, sell_size, sell_px)
+                changed = changed or ok
+        self._last_mm_quote = now
+        return changed
+
+    async def poll_engine_orders(self) -> None:
+        """Check resting GTC quotes without cancelling them on timeout."""
+        for oid, (side, size, price, action, engine) in list(self._engine_orders.items()):
+            if oid == "dry-run":
+                self._engine_orders.pop(oid, None)
+                continue
+            try:
+                info = self.account.get_order_status(oid)
+                if isinstance(info, str):
+                    info = json.loads(info)
+                if not isinstance(info, dict):
+                    continue
+                matched = info.get("size_matched", info.get("sizeMatched", info.get("filled", 0)))
+                try:
+                    matched = float(matched or 0.0)
+                except (TypeError, ValueError):
+                    matched = 0.0
+                matched = max(0.0, min(matched, size))
+                prev = getattr(self, "_engine_fills", {}).get(oid, 0.0)
+                delta = matched - prev
+                if delta > MIN_FILL_DELTA:
+                    fill_price = self._extract_order_fill_price(info, price)
+                    if action == "BUY":
+                        self.inventory.record_buy(side, delta, fill_price)
+                    else:
+                        self.inventory.record_sell(side, delta, fill_price)
+                    self.log_trade(side, fill_price, action, size=delta)
+                    self._engine_fills[oid] = matched
+                status = str(info.get("status", "")).lower()
+                if matched >= size - MIN_FILL_DELTA or status in {"filled", "matched", "closed", "cancelled", "canceled"}:
+                    self._engine_orders.pop(oid, None)
+                    self._engine_fills.pop(oid, None)
+            except Exception:
+                continue
 
     async def _check_momentum_logic(self, y_c: int, n_c: int) -> None:
         if self.order_state == OrderState.PENDING:
@@ -4153,6 +4360,8 @@ class MarketWorker:
         self.inventory.reset()
         self.entry_count = 0
         self._open_orders.clear()
+        self._engine_orders.clear()
+        self._engine_fills.clear()
         self._locked_skip_logged = False
         self.recent_logs.clear()
         self.update_dashboard()
@@ -4298,7 +4507,7 @@ class MarketWorker:
         return {
             "asset":              self.asset_type.upper(),
             "window":             self.window_slug,
-            "strategy":           "gabagool",
+            "strategy":           "arbigab",
             "yes":                round(self.prices.get("YES", 0) * 100),
             "no":                 round(self.prices.get("NO",  0) * 100),
             "yes_bid_c":          self.dashboard.get("yes_bid_c", 0),
@@ -4347,6 +4556,16 @@ class MarketWorker:
             "wins":               self.wins,
             "losses":             self.losses,
             "trade_count":        self.trade_count,
+            "engine":             self.dashboard.get("engine", "idle"),
+            "position_delta":     self.dashboard.get("position_delta", 0.0),
+            "pnl_if_up":           self.dashboard.get("pnl_if_up", 0.0),
+            "pnl_if_down":         self.dashboard.get("pnl_if_down", 0.0),
+            "mark_pnl":            self.dashboard.get("mark_pnl", 0.0),
+            "invested":            self.dashboard.get("invested", 0.0),
+            "locked_profit":       self.dashboard.get("locked_profit", 0.0),
+            "matched_pairs":       self.dashboard.get("matched_pairs", 0.0),
+            "preemptive_cancel_active": self.dashboard.get("preemptive_cancel_active", False),
+            "preemptive_cancel_side": self.dashboard.get("preemptive_cancel_side", "-"),
             "win_rate":           (round((self.wins / self.trade_count) * 100, 1)
                                    if self.trade_count > 0 else 0.0),
             "market_start_iso":   market_start_iso,
@@ -4620,7 +4839,7 @@ def create_dashboard(bots):
     layout.split_column(
         Layout(
             Panel(
-                f"[bold cyan]EMILIANO BOT — Gabagool[/bold cyan]\n"
+                f"[bold cyan]EMILIANO BOT — Arbigab-style 3 Engine[/bold cyan]\n"
                 f"Schedule ({_tz_label}): {_schedule_str}",
                 style="bold green", box=box.ROUNDED,
             ),
@@ -4652,7 +4871,11 @@ def create_dashboard(bots):
             f"[cyan]first <= {edge:.1f}c[/cyan] "
             f"(asks Y{y_ask}c N{n_ask}c | pair <= {pair_max:.1f}c)"
         )
-        strategy_text = ""
+        strategy_text = (
+            f"engine={d.get('engine', 'idle')} | "
+            f"Δ={d.get('position_delta', 0.0):+.2f} | "
+            f"PnL U/D=${d.get('pnl_if_up', 0.0):+.2f}/${d.get('pnl_if_down', 0.0):+.2f}"
+        )
 
         inv_y = d.get("yes_shares", 0)
         inv_n = d.get("no_shares", 0)
@@ -4690,7 +4913,10 @@ def create_dashboard(bots):
 {bought_text}
 [bold]ROI:[/] [{pnl_color}]+${pnl_dollars:.2f} ({pnl_pct:+.2f}%)[/{pnl_color}]
 [bold]Cooldown PnL:[/] [{cd_pnl_color}]${cd.get('cooldown_window_pnl', 0):+.2f}[/] (limit -${ASSET_MAX_CUMULATIVE_LOSS:.2f}){cd_blocked}
-[bold]Gabagool:[/] {ratio_text}{strategy_text}
+[bold]Engines:[/] {strategy_text}
+[bold]Economic:[/] Δ={d.get('position_delta', 0.0):+.2f} | mark=${d.get('mark_pnl', 0.0):+.2f} | locked=${d.get('locked_profit', 0.0):+.2f}
+[bold]Risk:[/] PnL if UP=${d.get('pnl_if_up', 0.0):+.2f} | if DOWN=${d.get('pnl_if_down', 0.0):+.2f}
+[bold]Legacy pair guard:[/] {ratio_text}
 [bold]Outcome:[/] [bold {'green' if d.get('outcome') == 'YES' else 'red' if d.get('outcome') == 'NO' else 'white'}]{d.get('outcome', 'PENDING')}[/]"""
             ),
             title=f"{d.get('asset', 'UNKNOWN')} · {time_window}",
@@ -4880,7 +5106,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        print("🚀 Starting EmilianoBot — Gabagool inventory-aware...")
+        print("🚀 Starting EmilianoBot — Arbigab-style 3-engine architecture...")
         for wc in WORKER_CONFIGS:
             print(f"   {wc.asset.upper()} {wc.window}: first<={wc.gabagool_initial_entry_threshold:.3f} "
                   f"| pair<={wc.gabagool_max_pair_cost:.3f} | order={wc.order_size} "

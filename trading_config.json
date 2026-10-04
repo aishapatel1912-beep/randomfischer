@@ -5,13 +5,14 @@
     "gabagool_min_profit_margin": 0.02,
     "gabagool_max_unpaired_shares": 5,
     "gabagool_min_time_to_resolution": 60,
-    "gabagool_price_buffer": 0.00,
-    "gabagool_inventory_soft_limit": 5.0,
+    "gabagool_price_buffer": 0.0,
+    "gabagool_inventory_soft_limit": 2.0,
     "gabagool_hedge_max_pair_cost": 0.995,
+    "gabagool_max_hedge_loss_per_share": 0.005,
     "gabagool_emergency_unwind_imbalance": 5.0,
     "gabagool_emergency_max_loss_per_share": 0.02,
     "gabagool_endgame_seconds": 30,
-    "gabagool_endgame_max_unpaired": 5.0,
+    "gabagool_endgame_max_unpaired": 1.0,
     "order_size_min": 5,
     "order_size_max": 5,
     "max_order_size": 5,
@@ -20,12 +21,47 @@
     "dry_run": true,
     "fill_timeout_ms": 10000,
     "fill_poll_ms": 400,
-    "enabled": true
+    "enabled": true,
+    "gabagool_falling_knife_enabled": true,
+    "gabagool_falling_knife_window_seconds": 3.0,
+    "gabagool_falling_knife_min_drop": 0.035,
+    "gabagool_falling_knife_fast_window_seconds": 1.0,
+    "gabagool_falling_knife_fast_drop": 0.015,
+    "gabagool_falling_knife_recovery_cents": 1.5,
+    "gabagool_falling_knife_cooldown_seconds": 5.0,
+    "gabagool_falling_knife_binance_confirm": 0.1,
+    "momentum_engine_enabled": true,
+    "momentum_min_delta": 0.0015,
+    "momentum_signal_max_age": 0.75,
+    "momentum_execution_mode": "single_taker",
+    "momentum_max_position_delta": 5.0,
+    "market_making_enabled": true,
+    "market_making_quote_size": 5.0,
+    "market_making_min_spread": 0.02,
+    "market_making_quote_offset": 0.01,
+    "market_making_max_position_delta": 5.0,
+    "market_making_requote_seconds": 0.4,
+    "spread_capture_enabled": true,
+    "spread_capture_trigger_sum": 0.995,
+    "spread_capture_max_entry_sum": 0.985,
+    "spread_capture_max_unpaired": 1.0,
+    "preemptive_cancel_enabled": true,
+    "preemptive_cancel_imbalance": 0.18,
+    "preemptive_cancel_momentum": 0.1,
+    "preemptive_cancel_price_delta": 0.0015
   },
   "workers": [
-    {"asset": "btc", "window": "5m"},
-    {"asset": "eth", "window": "5m"},
-    {"asset": "sol", "window": "5m"},
-    {"asset": "xrp", "window": "5m"}
+    {
+      "asset": "btc",
+      "window": "5m"
+    },
+    {
+      "asset": "eth",
+      "window": "5m"
+    },
+    {
+      "asset": "sol",
+      "window": "5m"
+    }
   ]
 }
