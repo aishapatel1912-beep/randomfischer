@@ -9,7 +9,7 @@
     "gabagool_inventory_soft_limit": 2.0,
     "gabagool_hedge_max_pair_cost": 0.995,
     "gabagool_max_hedge_loss_per_share": 0.005,
-    "gabagool_emergency_unwind_imbalance": 3.0,
+    "gabagool_emergency_unwind_imbalance": 5.0,
     "gabagool_emergency_max_loss_per_share": 0.02,
     "gabagool_endgame_seconds": 30,
     "gabagool_endgame_max_unpaired": 1.0,
