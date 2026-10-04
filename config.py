@@ -212,7 +212,7 @@ class WorkerConfig:
     momentum_max_position_delta: float = 5.0
     market_making_enabled: bool = True
     market_making_quote_size: float = 5.0
-    market_making_min_spread: float = 0.02
+    market_making_min_spread: float = 0.01
     market_making_quote_offset: float = 0.01
     market_making_max_position_delta: float = 5.0
     market_making_requote_seconds: float = 0.40
@@ -440,7 +440,7 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     momentum_max_position_delta = _parse_nonnegative_float("momentum_max_position_delta", _cfg_get(raw, defaults, "momentum_max_position_delta", default=5.0), 5.0)
     market_making_enabled = _parse_bool_value("market_making_enabled", _cfg_get(raw, defaults, "market_making_enabled", default=True), True)
     market_making_quote_size = _parse_order_size("market_making_quote_size", _cfg_get(raw, defaults, "market_making_quote_size", default=5.0), 5.0)
-    market_making_min_spread = _parse_nonnegative_float("market_making_min_spread", _cfg_get(raw, defaults, "market_making_min_spread", default=0.02), 0.02)
+    market_making_min_spread = _parse_nonnegative_float("market_making_min_spread", _cfg_get(raw, defaults, "market_making_min_spread", default=0.01), 0.01)
     market_making_quote_offset = _parse_nonnegative_float("market_making_quote_offset", _cfg_get(raw, defaults, "market_making_quote_offset", default=0.01), 0.01)
     market_making_max_position_delta = _parse_nonnegative_float("market_making_max_position_delta", _cfg_get(raw, defaults, "market_making_max_position_delta", default=5.0), 5.0)
     market_making_requote_seconds = _parse_nonnegative_float("market_making_requote_seconds", _cfg_get(raw, defaults, "market_making_requote_seconds", default=0.40), 0.40)

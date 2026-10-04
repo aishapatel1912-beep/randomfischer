@@ -3969,15 +3969,49 @@ class MarketWorker:
             await self.poll_engine_orders()
             return False
         if self.is_dry_run():
+            # Dry-run must exercise the real entry path.  Previously this branch
+            # only printed quotes, so the three-engine bot could appear healthy
+            # while producing zero simulated entries.  We model the first resting
+            # BUY quote as filled once per quote cycle; this is deliberately a
+            # simulation only and never affects live orders.
+            if self.engine_router.cancel.exposed_side(self):
+                self._last_mm_quote = now
+                return False
+            changed = False
             pos = economic_position(self)
-            print(
-                f"🧪 [MM QUOTE] {self.asset_type.upper()} {self.window_slug} | "
-                f"Y {self.best_bid('YES'):.3f}/{self.best_ask('YES'):.3f} "
-                f"N {self.best_bid('NO'):.3f}/{self.best_ask('NO'):.3f} | "
-                f"Δ={pos.position_delta:+.2f} PnL(U/D)={pos.pnl_if_yes:+.3f}/{pos.pnl_if_no:+.3f}"
-            )
+            for side in ("YES", "NO"):
+                bid, ask = self.best_bid(side), self.best_ask(side)
+                if bid <= 0 or ask <= 0 or ask <= bid:
+                    continue
+                if ask - bid + 1e-9 < cfg.market_making_min_spread:
+                    continue
+                if abs(pos.position_delta) >= cfg.market_making_max_position_delta:
+                    if (side == "YES" and pos.position_delta > 0) or (side == "NO" and pos.position_delta < 0):
+                        continue
+                quote_size = min(cfg.market_making_quote_size, self.engine_order_size(side))
+                if quote_size < MIN_SHARES:
+                    continue
+                buy_px = round(max(0.01, min(bid, ask - 0.01)), 2)
+                if buy_px <= 0 or buy_px >= ask:
+                    continue
+                print(
+                    f"🧪 [MM ENTRY] {self.asset_type.upper()} {self.window_slug} | "
+                    f"BUY {side} {quote_size:.2f}@{buy_px:.2f} "
+                    f"(bid={bid:.2f} ask={ask:.2f})"
+                )
+                self.inventory.record_buy(side, quote_size, buy_px)
+                self.log_trade(side, buy_px, "BUY", size=quote_size)
+                changed = True
+                break
+            if not changed:
+                print(
+                    f"🧪 [MM WAIT] {self.asset_type.upper()} {self.window_slug} | "
+                    f"Y {self.best_bid('YES'):.3f}/{self.best_ask('YES'):.3f} "
+                    f"N {self.best_bid('NO'):.3f}/{self.best_ask('NO'):.3f} | "
+                    f"Δ={pos.position_delta:+.2f} PnL(U/D)={pos.pnl_if_yes:+.3f}/{pos.pnl_if_no:+.3f}"
+                )
             self._last_mm_quote = now
-            return False
+            return changed
         await self.poll_engine_orders()
         if self.engine_router.cancel.exposed_side(self):
             return False
