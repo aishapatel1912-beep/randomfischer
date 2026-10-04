@@ -2950,12 +2950,28 @@ class MarketWorker:
                 f"GAB Y{inv.yes_shares:.0f}/N{inv.no_shares:.0f}"
             )
 
+    def get_market_countdown(self) -> str:
+        """Return the live market countdown from the absolute expiry timestamp.
+
+        The old dashboard timer was only refreshed when a Polymarket WebSocket
+        price event arrived.  During a quiet book that made the displayed clock
+        freeze even though the market was still advancing.  The countdown must
+        be derived from the clock, not from market-message frequency.
+        """
+        if not self.active_market or not self.active_market.get("expiry"):
+            return "--:--"
+        expiry = self.active_market["expiry"]
+        now = datetime.now(timezone.utc)
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        seconds_left = max(0, int((expiry - now).total_seconds()))
+        mins, secs = divmod(seconds_left, 60)
+        return f"{mins:02d}:{secs:02d}"
+
     def get_listener_countdown(self) -> str:
         if not self.active_market:
             return "--:--"
-        now          = datetime.now(timezone.utc)
-        remaining    = self.active_market["expiry"] - now
-        seconds_left = int(remaining.total_seconds())
+        seconds_left = self.market_seconds_left()
         activate = self.worker_config.listener_activate_secs
         if seconds_left <= activate:
             return "00:00"
@@ -4578,7 +4594,9 @@ class MarketWorker:
             "no_stop_c":          self.dashboard.get("no_stop_c", 0.0),
             "entry_count":        self.entry_count,
             "order_state":        order_status,
-            "timer":              self.dashboard.get("timer",    "--:--"),
+            # Always calculate the timer from absolute market expiry.  Do not
+            # use dashboard["timer"], which is event-driven by design.
+            "timer":              self.get_market_countdown(),
             "listener":           self.get_listener_countdown(),
             "status":             order_status,
             "position":           position_text,

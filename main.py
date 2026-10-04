@@ -1657,6 +1657,8 @@ function _initChartOverlay() {
 
 // Refresh history from backend every 2 minutes to pick up any new Redis flushes.
 setInterval(() => loadHistory(_pnlPeriod), 2 * 60 * 1000);
+setInterval(_refreshMarketCountdowns, 250);
+_refreshMarketCountdowns();
 setInterval(() => {
   if (_lastLivePnl != null) {
     _lastLiveTs = Date.now();
@@ -2084,6 +2086,22 @@ function renderBots(bots){
     i++;
   }
 }
+function _formatMarketCountdown(iso) {
+  if (!iso) return '--:--';
+  const end = new Date(iso).getTime();
+  if (!Number.isFinite(end)) return '--:--';
+  const seconds = Math.max(0, Math.ceil((end - Date.now()) / 1000));
+  const m = Math.floor(seconds / 60);
+  const sec = seconds % 60;
+  return `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+}
+
+function _refreshMarketCountdowns() {
+  document.querySelectorAll('[data-market-countdown]').forEach(el => {
+    el.textContent = _formatMarketCountdown(el.getAttribute('data-market-countdown'));
+  });
+}
+
 function _fmtCooldownRemaining(sec) {
   const s = Math.max(0, Number(sec) || 0);
   const m = Math.floor(s / 60);
@@ -2164,7 +2182,7 @@ function renderCard(bot){
           <span class="text-xl font-black tracking-tight" style="font-family:'Inter',system-ui,sans-serif;letter-spacing:-.02em;">${label}</span>
           ${badge}
         </div>
-        <span class="text-zinc-500 text-xs font-mono">${bot.timer||'--:--'}</span>
+        <span class="text-zinc-500 text-xs font-mono" data-market-countdown="${bot.market_end_iso||''}">${bot.timer||'--:--'}</span>
       </div>
       <div class="text-zinc-500 text-xs mb-3 font-mono">${mw}</div>
       ${cooldownBlock}
