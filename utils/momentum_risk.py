@@ -65,3 +65,35 @@ def stop_loss_triggered(current_price: float, entry_price: float, stop_loss_pct:
     except (TypeError, ValueError):
         return False
     return current <= stop
+
+
+def is_market_locked(
+    yes_price: float,
+    no_price: float,
+    *,
+    is_locked=None,
+    low: float = 0.01,
+    high: float = 1.00,
+) -> bool:
+    """Return True when either market leg is at a terminal/locked price.
+
+    ``strategies.momentum`` can pass the bot's existing ``is_locked_price``
+    callback so the utility follows the exact price-lock convention used by
+    the worker.  When no callback is supplied, the default is 1c/100c.
+    """
+    try:
+        yes = float(yes_price)
+        no = float(no_price)
+    except (TypeError, ValueError):
+        return False
+
+    if not (math.isfinite(yes) and math.isfinite(no)):
+        return False
+
+    if is_locked is not None:
+        try:
+            return bool(is_locked(yes)) or bool(is_locked(no))
+        except (TypeError, ValueError):
+            return False
+
+    return yes <= float(low) or yes >= float(high) or no <= float(low) or no >= float(high)
