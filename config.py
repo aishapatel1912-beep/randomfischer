@@ -96,6 +96,25 @@ def _parse_max_shares(name: str, value: Any, default: float) -> float:
     return v
 
 
+def _parse_nonnegative_float(name: str, value: Any, default: float) -> float:
+    raw = value if value is not None else default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        _fatal(f"{name}={raw!r} is not a valid number.")
+    if v < 0 or v != v or v in (float("inf"), float("-inf")):
+        _fatal(f"{name} must be >= 0 (got {raw!r}).")
+    return v
+
+
+def _parse_bool_value(name: str, value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _parse_cooldown_ms(name: str, value: Any, default: int) -> int:
     try:
         v = int(value if value is not None else default)
@@ -166,6 +185,20 @@ class WorkerConfig:
     gabagool_max_unpaired_shares: float = 5.0
     gabagool_min_time_to_resolution: int = 60
     gabagool_price_buffer: float = 0.00
+    gabagool_inventory_soft_limit: float = 2.0
+    gabagool_hedge_max_pair_cost: float = 0.995
+    gabagool_emergency_unwind_imbalance: float = 3.0
+    gabagool_emergency_max_loss_per_share: float = 0.02
+    gabagool_endgame_seconds: int = 30
+    gabagool_endgame_max_unpaired: float = 1.0
+    gabagool_falling_knife_enabled: bool = True
+    gabagool_falling_knife_window_seconds: float = 3.0
+    gabagool_falling_knife_min_drop: float = 0.035
+    gabagool_falling_knife_fast_window_seconds: float = 1.0
+    gabagool_falling_knife_fast_drop: float = 0.015
+    gabagool_falling_knife_recovery_cents: float = 1.5
+    gabagool_falling_knife_cooldown_seconds: float = 5.0
+    gabagool_falling_knife_binance_confirm: float = 0.10
     trade_cooldown_ms: int = 3000
     order_size_min: float = 5.0
     order_size_max: float = 5.0
@@ -258,12 +291,108 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     gabagool_price_buffer = float(
         _cfg_get(raw, defaults, "gabagool_price_buffer", default=0.0)
     )
+    gabagool_inventory_soft_limit = _parse_nonnegative_float(
+        "gabagool_inventory_soft_limit",
+        _cfg_get(raw, defaults, "gabagool_inventory_soft_limit"),
+        float(defaults.get("gabagool_inventory_soft_limit", 2.0)),
+    )
+    gabagool_hedge_max_pair_cost = _parse_unit_fraction(
+        "gabagool_hedge_max_pair_cost",
+        _cfg_get(raw, defaults, "gabagool_hedge_max_pair_cost"),
+        float(defaults.get("gabagool_hedge_max_pair_cost", 0.995)),
+    )
+    gabagool_emergency_unwind_imbalance = _parse_nonnegative_float(
+        "gabagool_emergency_unwind_imbalance",
+        _cfg_get(raw, defaults, "gabagool_emergency_unwind_imbalance"),
+        float(defaults.get("gabagool_emergency_unwind_imbalance", 3.0)),
+    )
+    gabagool_emergency_max_loss_per_share = _parse_unit_fraction(
+        "gabagool_emergency_max_loss_per_share",
+        _cfg_get(raw, defaults, "gabagool_emergency_max_loss_per_share"),
+        float(defaults.get("gabagool_emergency_max_loss_per_share", 0.02)),
+    )
+    gabagool_endgame_seconds = int(
+        _cfg_get(raw, defaults, "gabagool_endgame_seconds", default=30)
+    )
+    gabagool_endgame_max_unpaired = _parse_nonnegative_float(
+        "gabagool_endgame_max_unpaired",
+        _cfg_get(raw, defaults, "gabagool_endgame_max_unpaired"),
+        float(defaults.get("gabagool_endgame_max_unpaired", 1.0)),
+    )
     if gabagool_min_time_to_resolution < 0:
         _fatal(f"{asset}:{window}: gabagool_min_time_to_resolution must be >= 0")
     if gabagool_price_buffer < 0 or gabagool_price_buffer > 0.05:
         _fatal(f"{asset}:{window}: gabagool_price_buffer must be between 0 and 0.05")
     if gabagool_min_profit_margin >= 1:
         _fatal(f"{asset}:{window}: gabagool_min_profit_margin must be < 1")
+    if gabagool_hedge_max_pair_cost > 1.0 + 1e-9:
+        _fatal(f"{asset}:{window}: gabagool_hedge_max_pair_cost must be <= 1.0")
+    if gabagool_inventory_soft_limit > gabagool_max_unpaired_shares + 1e-9:
+        _fatal(
+            f"{asset}:{window}: gabagool_inventory_soft_limit={gabagool_inventory_soft_limit} "
+            f"cannot exceed gabagool_max_unpaired_shares={gabagool_max_unpaired_shares}"
+        )
+    if gabagool_emergency_unwind_imbalance > gabagool_max_unpaired_shares + 1e-9:
+        _fatal(
+            f"{asset}:{window}: gabagool_emergency_unwind_imbalance={gabagool_emergency_unwind_imbalance} "
+            f"cannot exceed gabagool_max_unpaired_shares={gabagool_max_unpaired_shares}"
+        )
+    if gabagool_endgame_seconds < 0:
+        _fatal(f"{asset}:{window}: gabagool_endgame_seconds must be >= 0")
+    if gabagool_endgame_max_unpaired > gabagool_max_unpaired_shares + 1e-9:
+        _fatal(
+            f"{asset}:{window}: gabagool_endgame_max_unpaired={gabagool_endgame_max_unpaired} "
+            f"cannot exceed gabagool_max_unpaired_shares={gabagool_max_unpaired_shares}"
+        )
+    gabagool_falling_knife_enabled = _parse_bool_value(
+        "gabagool_falling_knife_enabled",
+        _cfg_get(raw, defaults, "gabagool_falling_knife_enabled", default=True),
+        True,
+    )
+    gabagool_falling_knife_window_seconds = _parse_nonnegative_float(
+        "gabagool_falling_knife_window_seconds",
+        _cfg_get(raw, defaults, "gabagool_falling_knife_window_seconds", default=3.0),
+        3.0,
+    )
+    gabagool_falling_knife_min_drop = _parse_nonnegative_float(
+        "gabagool_falling_knife_min_drop",
+        _cfg_get(raw, defaults, "gabagool_falling_knife_min_drop", default=0.035),
+        0.035,
+    )
+    gabagool_falling_knife_fast_window_seconds = _parse_nonnegative_float(
+        "gabagool_falling_knife_fast_window_seconds",
+        _cfg_get(raw, defaults, "gabagool_falling_knife_fast_window_seconds", default=1.0),
+        1.0,
+    )
+    gabagool_falling_knife_fast_drop = _parse_nonnegative_float(
+        "gabagool_falling_knife_fast_drop",
+        _cfg_get(raw, defaults, "gabagool_falling_knife_fast_drop", default=0.015),
+        0.015,
+    )
+    gabagool_falling_knife_recovery_cents = _parse_nonnegative_float(
+        "gabagool_falling_knife_recovery_cents",
+        _cfg_get(raw, defaults, "gabagool_falling_knife_recovery_cents", default=1.5),
+        1.5,
+    )
+    gabagool_falling_knife_cooldown_seconds = _parse_nonnegative_float(
+        "gabagool_falling_knife_cooldown_seconds",
+        _cfg_get(raw, defaults, "gabagool_falling_knife_cooldown_seconds", default=5.0),
+        5.0,
+    )
+    gabagool_falling_knife_binance_confirm = _parse_nonnegative_float(
+        "gabagool_falling_knife_binance_confirm",
+        _cfg_get(raw, defaults, "gabagool_falling_knife_binance_confirm", default=0.10),
+        0.10,
+    )
+    if gabagool_falling_knife_window_seconds <= 0:
+        _fatal(f"{asset}:{window}: gabagool_falling_knife_window_seconds must be > 0")
+    if gabagool_falling_knife_fast_window_seconds <= 0:
+        _fatal(f"{asset}:{window}: gabagool_falling_knife_fast_window_seconds must be > 0")
+    if gabagool_falling_knife_fast_window_seconds > gabagool_falling_knife_window_seconds:
+        _fatal(f"{asset}:{window}: falling-knife fast window cannot exceed main window")
+    if gabagool_falling_knife_min_drop <= 0 and gabagool_falling_knife_fast_drop <= 0:
+        _fatal(f"{asset}:{window}: at least one falling-knife drop threshold must be > 0")
+
     if gabagool_max_pair_cost > 1.0 - gabagool_min_profit_margin + 1e-9:
         _fatal(
             f"{asset}:{window}: gabagool_max_pair_cost={gabagool_max_pair_cost} "
@@ -401,6 +530,20 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         gabagool_max_unpaired_shares=gabagool_max_unpaired_shares,
         gabagool_min_time_to_resolution=gabagool_min_time_to_resolution,
         gabagool_price_buffer=gabagool_price_buffer,
+        gabagool_inventory_soft_limit=gabagool_inventory_soft_limit,
+        gabagool_hedge_max_pair_cost=gabagool_hedge_max_pair_cost,
+        gabagool_emergency_unwind_imbalance=gabagool_emergency_unwind_imbalance,
+        gabagool_emergency_max_loss_per_share=gabagool_emergency_max_loss_per_share,
+        gabagool_endgame_seconds=gabagool_endgame_seconds,
+        gabagool_endgame_max_unpaired=gabagool_endgame_max_unpaired,
+        gabagool_falling_knife_enabled=gabagool_falling_knife_enabled,
+        gabagool_falling_knife_window_seconds=gabagool_falling_knife_window_seconds,
+        gabagool_falling_knife_min_drop=gabagool_falling_knife_min_drop,
+        gabagool_falling_knife_fast_window_seconds=gabagool_falling_knife_fast_window_seconds,
+        gabagool_falling_knife_fast_drop=gabagool_falling_knife_fast_drop,
+        gabagool_falling_knife_recovery_cents=gabagool_falling_knife_recovery_cents,
+        gabagool_falling_knife_cooldown_seconds=gabagool_falling_knife_cooldown_seconds,
+        gabagool_falling_knife_binance_confirm=gabagool_falling_knife_binance_confirm,
         trade_cooldown_ms=trade_cooldown_ms,
         order_size_min=order_size_min,
         order_size_max=order_size_max,
