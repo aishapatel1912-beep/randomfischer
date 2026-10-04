@@ -2757,11 +2757,6 @@ class MarketWorker:
             "gabagool_min_profit_margin_c": round(worker_config.gabagool_min_profit_margin * 100, 1),
             "gabagool_max_unpaired_shares": worker_config.gabagool_max_unpaired_shares,
             "gabagool_min_time_to_resolution": worker_config.gabagool_min_time_to_resolution,
-            "gabagool_inventory_soft_limit": worker_config.gabagool_inventory_soft_limit,
-            "gabagool_hedge_max_pair_cost_c": round(worker_config.gabagool_hedge_max_pair_cost * 100, 1),
-            "gabagool_emergency_unwind_imbalance": worker_config.gabagool_emergency_unwind_imbalance,
-            "gabagool_endgame_seconds": worker_config.gabagool_endgame_seconds,
-            "gabagool_endgame_max_unpaired": worker_config.gabagool_endgame_max_unpaired,
             "entry_count":        0,
         }
         self.recent_logs: Deque[str] = deque(maxlen=4)
@@ -2926,111 +2921,6 @@ class MarketWorker:
             min_entry_seconds_left=wc.min_entry_seconds_left,
         )
 
-    def _gabagool_pair_ceiling(self) -> float:
-        """Return the pair-cost ceiling appropriate to current inventory skew."""
-        cfg = self.worker_config
-        yes = self.inventory.shares("YES")
-        no = self.inventory.shares("NO")
-        if abs(yes - no) > cfg.gabagool_inventory_soft_limit + 1e-9:
-            return cfg.gabagool_hedge_max_pair_cost
-        return cfg.gabagool_max_pair_cost
-
-    async def _manage_gabagool_inventory(self) -> bool:
-        """Prevent a cheap first leg from turning into a large naked position.
-
-        Returns True when this tick was consumed by an inventory-risk action.
-        The normal path is to let the strategy buy the underweight side. If the
-        hedge is no longer economically available, an overweight unpaired leg
-        is reduced with a tightly bounded FOK sell.
-        """
-        cfg = self.worker_config
-        inv = self.inventory
-        yes = float(inv.yes_shares)
-        no = float(inv.no_shares)
-        imbalance = yes - no
-        abs_imbalance = abs(imbalance)
-        if abs_imbalance <= cfg.gabagool_inventory_soft_limit + 1e-9:
-            return False
-
-        seconds_left = self.market_seconds_left()
-        endgame = seconds_left <= cfg.gabagool_endgame_seconds
-        hard_limit = cfg.gabagool_endgame_max_unpaired if endgame else cfg.gabagool_max_unpaired_shares
-        if abs_imbalance <= hard_limit + 1e-9:
-            # The strategy gets first chance to buy the underweight side.
-            under = "NO" if imbalance > 0 else "YES"
-            ask = self.best_ask(under)
-            overweight = "YES" if imbalance > 0 else "NO"
-            overweight_avg = inv.avg_cost(overweight)
-            ceiling = cfg.gabagool_hedge_max_pair_cost
-            max_hedge_price = ceiling - overweight_avg
-            executable = math.ceil((ask - 1e-9) * 100.0) / 100.0 if ask > 0 else 0.0
-            if ask > 0 and executable <= max_hedge_price + 1e-9:
-                return False
-
-        # If the hedge cannot be bought cheaply enough, do not let the naked
-        # leg sit there indefinitely. Only unwind the genuinely unpaired part.
-        if (not endgame) and abs_imbalance < cfg.gabagool_emergency_unwind_imbalance - 1e-9:
-            return False
-        if endgame and abs_imbalance <= cfg.gabagool_endgame_max_unpaired + 1e-9:
-            return False
-
-        overweight = "YES" if imbalance > 0 else "NO"
-        shares = max(0.0, abs_imbalance)
-        bid = self.best_bid(overweight)
-        if shares <= MIN_FILL_DELTA or bid <= 0 or is_locked_price(bid):
-            return False
-
-        avg = inv.avg_cost(overweight)
-        allowed_loss = cfg.gabagool_emergency_max_loss_per_share
-        # In the final seconds, carrying inventory through resolution is more
-        # dangerous than realizing a small controlled loss, so use the same
-        # configured cap rather than widening it silently.
-        if bid + allowed_loss + 1e-9 < avg:
-            print(
-                f"⚠️ [GABAGOOL RISK] {self.asset_type.upper()} {self.window_slug} | "
-                f"imbalance={abs_imbalance:.2f} {overweight} | "
-                f"bid={bid:.2f} avg={avg:.2f} — hedge too expensive and unwind "
-                f"would exceed loss cap; HOLD, do not add exposure"
-            )
-            return True
-
-        sell_size = min(shares, cfg.max_order_size, cfg.max_shares)
-        sell_size = round(sell_size, 4)
-        if sell_size <= MIN_FILL_DELTA:
-            return False
-
-        print(
-            f"🛡️ [GABAGOOL RISK] {self.asset_type.upper()} {self.window_slug} | "
-            f"unwinding {sell_size:.2f} {overweight} @ {round(bid*100)}c | "
-            f"imbalance={abs_imbalance:.2f} avg={avg:.2f} max_loss={allowed_loss:.2f}"
-        )
-
-        if self.is_dry_run():
-            fill_size, fill_price = sell_size, round(bid, 2)
-        else:
-            fill_size, fill_price = await self.place_exit_sell(
-                overweight, round(bid, 2), sell_size,
-            )
-        if fill_size <= MIN_FILL_DELTA:
-            return True
-
-        pnl = inv.record_sell(overweight, fill_size, fill_price)
-        self.log_trade(overweight, fill_price, "SELL", size=fill_size)
-        self.log_pnl("GABAGOOL_INVENTORY_UNWIND", pnl, {
-            "side": overweight,
-            "shares": fill_size,
-            "entry_price": avg,
-            "exit_price": fill_price,
-            "imbalance_before": imbalance,
-            "imbalance_after": yes - no - (fill_size if overweight == "YES" else -fill_size),
-            "reason": "hedge_unavailable_within_pair_cost",
-        })
-        print(
-            f"  🛡️ [GABAGOOL RISK] sold {fill_size:.2f} {overweight} @ "
-            f"{round(fill_price*100)}c | realized pnl=${pnl:+.4f}"
-        )
-        return True
-
     def validate_entry_execution(
         self, decision: MomentumDecision, legs: List[Tuple[str, float]],
     ) -> bool:
@@ -3048,8 +2938,7 @@ class MarketWorker:
             )
             return False
         if self.market_seconds_left() < cfg.gabagool_min_time_to_resolution:
-            if abs(self.inventory.shares("YES") - self.inventory.shares("NO")) <= 1e-9:
-                return False
+            return False
 
         inv = self.inventory
         current = inv.shares(side)
@@ -3066,11 +2955,10 @@ class MarketWorker:
         ) / max(current + decision.size, 1e-9)
         if other_avg > 0:
             projected_pair = projected_avg + other_avg
-            pair_ceiling = self._gabagool_pair_ceiling()
-            if projected_pair > pair_ceiling + 1e-9:
+            if projected_pair > cfg.gabagool_max_pair_cost + 1e-9:
                 print(
                     f"❌ [GABAGOOL ABORT] projected pair="
-                    f"{projected_pair:.4f} > max={pair_ceiling:.4f}"
+                    f"{projected_pair:.4f} > max={cfg.gabagool_max_pair_cost:.4f}"
                 )
                 return False
         return True
@@ -3300,11 +3188,6 @@ class MarketWorker:
         self.dashboard["gabagool_min_profit_margin_c"] = round(wc.gabagool_min_profit_margin * 100, 1)
         self.dashboard["gabagool_max_unpaired_shares"] = wc.gabagool_max_unpaired_shares
         self.dashboard["gabagool_min_time_to_resolution"] = wc.gabagool_min_time_to_resolution
-        self.dashboard["gabagool_inventory_soft_limit"] = wc.gabagool_inventory_soft_limit
-        self.dashboard["gabagool_hedge_max_pair_cost_c"] = round(wc.gabagool_hedge_max_pair_cost * 100, 1)
-        self.dashboard["gabagool_emergency_unwind_imbalance"] = wc.gabagool_emergency_unwind_imbalance
-        self.dashboard["gabagool_endgame_seconds"] = wc.gabagool_endgame_seconds
-        self.dashboard["gabagool_endgame_max_unpaired"] = wc.gabagool_endgame_max_unpaired
         self.dashboard["entry_count"] = self.entry_count
         for side in ("YES", "NO"):
             shares = inv.shares(side)
@@ -3366,8 +3249,7 @@ class MarketWorker:
         if ask <= 0 or is_locked_price(ask):
             return []
         if self.market_seconds_left() < cfg.gabagool_min_time_to_resolution:
-            if abs(self.inventory.shares("YES") - self.inventory.shares("NO")) <= 1e-9:
-                return []
+            return []
 
         # The strategy already computed a safe 1-cent limit. Re-quote only if
         # the live ask has not moved beyond that limit.
@@ -3390,7 +3272,7 @@ class MarketWorker:
             projected_avg = (
                 (current * current_avg) + (decision.size * executable)
             ) / max(current + decision.size, 1e-9)
-            if projected_avg + other_avg > self._gabagool_pair_ceiling() + 1e-9:
+            if projected_avg + other_avg > cfg.gabagool_max_pair_cost + 1e-9:
                 return []
 
         return [(side, executable)]
@@ -3706,15 +3588,6 @@ class MarketWorker:
         if at_cap:
             return
 
-        # Inventory risk gets priority over finding another cheap entry. This
-        # is the key fix for the previous failure mode: a stranded first leg
-        # can no longer be followed by more entries just because another side
-        # briefly looks cheap.
-        if await self._manage_gabagool_inventory():
-            self._update_momentum_dashboard()
-            self.update_dashboard()
-            return
-
         decision = await self.strategy.evaluate(self)
         if decision:
             if not self.can_enter():
@@ -3906,7 +3779,7 @@ class MarketWorker:
             "market":              market_name,
             "slug":                slug,
             "side":                display_side,
-            "strategy":            "gabagool",
+            "strategy":            "momentum",
             "yes_shares":          round(inv.yes_shares, 4),
             "no_shares":           round(inv.no_shares, 4),
             "yes_avg_price_c":     yes_avg_c,
@@ -3966,9 +3839,6 @@ class MarketWorker:
         self.dashboard["yes_avg_price_c"]   = 0.0
         self.dashboard["no_avg_price_c"]    = 0.0
         self.dashboard["pair_avg_price_c"]  = 0.0
-        self.dashboard["gabagool_inventory_soft_limit"] = self.worker_config.gabagool_inventory_soft_limit
-        self.dashboard["gabagool_hedge_max_pair_cost_c"] = round(self.worker_config.gabagool_hedge_max_pair_cost * 100, 1)
-        self.dashboard["gabagool_endgame_max_unpaired"] = self.worker_config.gabagool_endgame_max_unpaired
         self.dashboard["gabagool_initial_entry_threshold_c"] = round(self.worker_config.gabagool_initial_entry_threshold * 100, 1)
         self.dashboard["gabagool_max_pair_cost_c"] = round(self.worker_config.gabagool_max_pair_cost * 100, 1)
         self.dashboard["gabagool_min_profit_margin_c"] = round(self.worker_config.gabagool_min_profit_margin * 100, 1)
@@ -4139,13 +4009,6 @@ class MarketWorker:
             "gabagool_min_profit_margin_c": round(wc.gabagool_min_profit_margin * 100, 1),
             "gabagool_max_unpaired_shares": wc.gabagool_max_unpaired_shares,
             "gabagool_min_time_to_resolution": wc.gabagool_min_time_to_resolution,
-            "gabagool_inventory_soft_limit": wc.gabagool_inventory_soft_limit,
-            "gabagool_hedge_max_pair_cost": wc.gabagool_hedge_max_pair_cost,
-            "gabagool_hedge_max_pair_cost_c": round(wc.gabagool_hedge_max_pair_cost * 100, 1),
-            "gabagool_emergency_unwind_imbalance": wc.gabagool_emergency_unwind_imbalance,
-            "gabagool_emergency_max_loss_per_share": wc.gabagool_emergency_max_loss_per_share,
-            "gabagool_endgame_seconds": wc.gabagool_endgame_seconds,
-            "gabagool_endgame_max_unpaired": wc.gabagool_endgame_max_unpaired,
             "max_shares":         wc.max_shares,
             "yes_shares":         self.dashboard.get("yes_shares", 0.0),
             "no_shares":          self.dashboard.get("no_shares", 0.0),
@@ -4349,10 +4212,6 @@ class MarketWorker:
         print(f"  Min gross margin  : {wc.gabagool_min_profit_margin:.1%}")
         print(f"  Max unpaired      : {wc.gabagool_max_unpaired_shares:.1f} shares")
         print(f"  Min time to expiry: {wc.gabagool_min_time_to_resolution}s")
-        print(f"  Inventory soft cap : {wc.gabagool_inventory_soft_limit:.1f} shares skew")
-        print(f"  Hedge pair ceiling : {wc.gabagool_hedge_max_pair_cost:.3f} ({wc.gabagool_hedge_max_pair_cost*100:.1f}c)")
-        print(f"  Emergency unwind   : {wc.gabagool_emergency_unwind_imbalance:.1f}+ skew, loss cap {wc.gabagool_emergency_max_loss_per_share:.2f}/sh")
-        print(f"  Endgame protection : {wc.gabagool_endgame_seconds}s, max unpaired {wc.gabagool_endgame_max_unpaired:.1f}")
         if wc.random_order_size:
             order_size_label = (
                 f"{wc.order_size_min}-{wc.order_size_max} shares random "
@@ -4513,7 +4372,7 @@ def create_dashboard(bots):
 {bought_text}
 [bold]ROI:[/] [{pnl_color}]+${pnl_dollars:.2f} ({pnl_pct:+.2f}%)[/{pnl_color}]
 [bold]Cooldown PnL:[/] [{cd_pnl_color}]${cd.get('cooldown_window_pnl', 0):+.2f}[/] (limit -${ASSET_MAX_CUMULATIVE_LOSS:.2f}){cd_blocked}
-[bold]Gabagool:[/] {ratio_text}{strategy_text}
+[bold]Momentum:[/] {ratio_text}{strategy_text}
 [bold]Outcome:[/] [bold {'green' if d.get('outcome') == 'YES' else 'red' if d.get('outcome') == 'NO' else 'white'}]{d.get('outcome', 'PENDING')}[/]"""
             ),
             title=f"{d.get('asset', 'UNKNOWN')} · {time_window}",
@@ -4703,7 +4562,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        print("🚀 Starting EmilianoBot — Gabagool inventory-aware...")
+        print("🚀 Starting EmilianoBot — Momentum...")
         for wc in WORKER_CONFIGS:
             print(f"   {wc.asset.upper()} {wc.window}: first<={wc.gabagool_initial_entry_threshold:.3f} "
                   f"| pair<={wc.gabagool_max_pair_cost:.3f} | order={wc.order_size} "

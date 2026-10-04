@@ -1,17 +1,15 @@
-"""Inventory-aware Gabagool-style paired accumulation for Polymarket crypto UP/DOWN markets.
+"""Gabagool-style paired accumulation for Polymarket crypto UP/DOWN markets.
 
-Core behavior:
-  * First position: only take a genuinely cheap leg.
-  * Once inventory exists: the underweight leg has absolute priority.
-  * A normal hedge must preserve the normal pair-cost ceiling.
-  * A stressed hedge may use a slightly looser rescue ceiling so a cheap first
-    leg cannot strand the worker indefinitely with naked inventory.
-  * Endgame inventory is much tighter than normal inventory.
-  * The execution layer can unwind the overweight leg when buying the hedge is
-    no longer economically sensible.
+The strategy is deliberately non-directional:
+  1. Start with whichever side is temporarily cheap.
+  2. After the first fill, seek the opposite side.
+  3. Every new fill must keep the weighted-average YES + NO pair cost below
+     the configured ceiling.
+  4. Prefer the under-hedged side so inventory stays close to delta-neutral.
+  5. Never use the old 90c directional momentum entry rule.
 
-This is a public-mechanics approximation of a Gabagool-style method; it is not
-private Gabagool22 source code.
+This is a public-mechanics approximation of the Gabagool-style method; it is
+not a claim to reproduce any private Gabagool22 source code.
 """
 
 from __future__ import annotations
@@ -33,6 +31,7 @@ _EPS = 1e-9
 class GabagoolStrategy:
     @staticmethod
     def _leg(worker: "MarketWorker", side: str) -> Tuple[float, float]:
+        """Return (shares, weighted average entry) for one token."""
         inv = worker.inventory
         return float(inv.shares(side)), float(inv.avg_cost(side))
 
@@ -53,25 +52,24 @@ class GabagoolStrategy:
 
     @staticmethod
     def _round_up_tick(price: float) -> float:
+        """Round a buy limit upward to Polymarket's 1-cent tick."""
         return math.ceil((price - _EPS) * 100.0) / 100.0
 
     async def evaluate(self, worker: "MarketWorker") -> Optional[GabagoolDecision]:
         from bot import OrderState, is_locked_price
 
-        if worker.order_state == OrderState.PENDING or worker._order_lock.locked():
+        if worker.order_state == OrderState.PENDING:
             return None
-        if not worker.active_market or not worker.can_enter():
+        if worker._order_lock.locked():
+            return None
+        if not worker.active_market:
+            return None
+        if not worker.can_enter():
             return None
 
         cfg = worker.worker_config
         seconds_left = worker.market_seconds_left()
-        # The minimum-time gate applies to opening fresh risk, not to a hedge
-        # that reduces an already-existing imbalance. This distinction is
-        # essential in the final minute.
-        pre_yes_shares = float(worker.inventory.shares("YES"))
-        pre_no_shares = float(worker.inventory.shares("NO"))
-        pre_imbalance = abs(pre_yes_shares - pre_no_shares)
-        if seconds_left < cfg.gabagool_min_time_to_resolution and pre_imbalance <= _EPS:
+        if seconds_left < cfg.gabagool_min_time_to_resolution:
             return None
 
         yes_ask = worker.best_ask("YES")
@@ -84,58 +82,46 @@ class GabagoolStrategy:
 
         yes_shares, yes_avg = self._leg(worker, "YES")
         no_shares, no_avg = self._leg(worker, "NO")
-        imbalance = yes_shares - no_shares
-        abs_imbalance = abs(imbalance)
-        endgame = seconds_left <= cfg.gabagool_endgame_seconds
 
-        # Endgame rule: once the market is close to resolution, never open a
-        # fresh first leg and never intentionally increase an existing skew.
-        if endgame and abs_imbalance <= _EPS:
-            return None
-
+        # First leg: buy the cheaper side only when it is genuinely cheap.
         if yes_shares <= _EPS and no_shares <= _EPS:
             picked = self._select_first_side(
-                yes_ask, no_ask, cfg.gabagool_initial_entry_threshold,
+                yes_ask,
+                no_ask,
+                cfg.gabagool_initial_entry_threshold,
             )
             if picked is None:
                 return None
             side, ask = picked
             first_leg = True
-            opposite_shares = 0.0
             opposite_avg = 0.0
+            opposite_shares = 0.0
             target_price = cfg.gabagool_initial_entry_threshold
             reason = "first_cheap_leg"
         else:
             first_leg = False
 
-            # Inventory is the primary constraint. If we are even slightly
-            # outside the soft band, ONLY the underweight side is eligible.
-            if imbalance > _EPS:
+            # Strictly hedge the side with fewer shares.  If already balanced,
+            # add to whichever side offers the better executable price.
+            if yes_shares > no_shares + _EPS:
                 side = "NO"
-                reason = "inventory_hedge_no"
-            elif imbalance < -_EPS:
+            elif no_shares > yes_shares + _EPS:
                 side = "YES"
-                reason = "inventory_hedge_yes"
             else:
                 side = "YES" if yes_ask <= no_ask else "NO"
-                reason = "balanced_cheap_leg"
 
             ask = yes_ask if side == "YES" else no_ask
             opposite = "NO" if side == "YES" else "YES"
             opposite_shares, opposite_avg = self._leg(worker, opposite)
 
-            # Normal hedging is strict. Once the worker is outside the soft
-            # inventory band, use the rescue ceiling instead of simply giving
-            # up and leaving the original leg naked forever.
-            if opposite_shares > _EPS and opposite_avg > 0:
-                pair_ceiling = (
-                    cfg.gabagool_hedge_max_pair_cost
-                    if abs_imbalance > cfg.gabagool_inventory_soft_limit + _EPS
-                    else cfg.gabagool_max_pair_cost
-                )
-                target_price = pair_ceiling - opposite_avg
-            else:
+            # With an existing opposite leg, this is the maximum price that
+            # keeps the final weighted pair cost under the ceiling.
+            if opposite_shares <= _EPS or opposite_avg <= 0:
                 target_price = cfg.gabagool_initial_entry_threshold
+            else:
+                target_price = cfg.gabagool_max_pair_cost - opposite_avg
+
+            reason = "hedge_underweight" if yes_shares != no_shares else "balanced_cheap_leg"
 
         if target_price <= 0 or ask <= 0:
             return None
@@ -144,35 +130,34 @@ class GabagoolStrategy:
         if size is None or size <= 0:
             return None
 
+        # Respect the configured unpaired inventory ceiling.  This is the
+        # principal risk control while waiting for the opposite side.
         current_shares = yes_shares if side == "YES" else no_shares
         other_shares = no_shares if side == "YES" else yes_shares
         projected_unpaired = abs((current_shares + size) - other_shares)
-
-        unpaired_limit = cfg.gabagool_endgame_max_unpaired if endgame else cfg.gabagool_max_unpaired_shares
-        if projected_unpaired > unpaired_limit + _EPS:
+        if projected_unpaired > cfg.gabagool_max_unpaired_shares + _EPS:
             return None
 
+        # Calculate the minimum 1-cent executable limit. If the ask cannot be
+        # bought at a whole-cent price without breaking the pair-cost ceiling,
+        # wait for the book to improve rather than overpaying.
         executable_price = self._round_up_tick(ask + cfg.gabagool_price_buffer)
         executable_price = min(executable_price, target_price)
         executable_price = round(executable_price, 2)
         if executable_price + _EPS < ask:
             return None
 
-        current_avg = yes_avg if side == "YES" else no_avg
+        current_shares, current_avg = self._leg(worker, side)
         projected_avg = (
             (current_shares * current_avg) + (size * executable_price)
         ) / max(current_shares + size, _EPS)
 
-        projected_pair_cost = 0.0
         if opposite_shares > _EPS and opposite_avg > 0:
             projected_pair_cost = projected_avg + opposite_avg
-            pair_ceiling = (
-                cfg.gabagool_hedge_max_pair_cost
-                if abs_imbalance > cfg.gabagool_inventory_soft_limit + _EPS
-                else cfg.gabagool_max_pair_cost
-            )
-            if projected_pair_cost > pair_ceiling + _EPS:
+            if projected_pair_cost > cfg.gabagool_max_pair_cost + _EPS:
                 return None
+        else:
+            projected_pair_cost = 0.0
 
         return GabagoolDecision(
             side=side,
@@ -188,4 +173,5 @@ class GabagoolStrategy:
         await execute_momentum_decision(worker, decision)
 
 
+# Compatibility name used by bot.py.
 MomentumStrategy = GabagoolStrategy

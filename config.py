@@ -166,12 +166,6 @@ class WorkerConfig:
     gabagool_max_unpaired_shares: float = 5.0
     gabagool_min_time_to_resolution: int = 60
     gabagool_price_buffer: float = 0.00
-    gabagool_inventory_soft_limit: float = 2.0
-    gabagool_hedge_max_pair_cost: float = 0.995
-    gabagool_emergency_unwind_imbalance: float = 3.0
-    gabagool_emergency_max_loss_per_share: float = 0.02
-    gabagool_endgame_seconds: int = 30
-    gabagool_endgame_max_unpaired: float = 1.0
     trade_cooldown_ms: int = 3000
     order_size_min: float = 5.0
     order_size_max: float = 5.0
@@ -264,59 +258,12 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     gabagool_price_buffer = float(
         _cfg_get(raw, defaults, "gabagool_price_buffer", default=0.0)
     )
-    gabagool_inventory_soft_limit = _parse_max_shares(
-        "gabagool_inventory_soft_limit",
-        _cfg_get(raw, defaults, "gabagool_inventory_soft_limit"),
-        float(defaults.get("gabagool_inventory_soft_limit", 2.0)),
-    )
-    gabagool_hedge_max_pair_cost = _parse_unit_fraction(
-        "gabagool_hedge_max_pair_cost",
-        _cfg_get(raw, defaults, "gabagool_hedge_max_pair_cost"),
-        float(defaults.get("gabagool_hedge_max_pair_cost", 0.995)),
-    )
-    gabagool_emergency_unwind_imbalance = _parse_max_shares(
-        "gabagool_emergency_unwind_imbalance",
-        _cfg_get(raw, defaults, "gabagool_emergency_unwind_imbalance"),
-        float(defaults.get("gabagool_emergency_unwind_imbalance", 3.0)),
-    )
-    gabagool_emergency_max_loss_per_share = _parse_unit_fraction(
-        "gabagool_emergency_max_loss_per_share",
-        _cfg_get(raw, defaults, "gabagool_emergency_max_loss_per_share"),
-        float(defaults.get("gabagool_emergency_max_loss_per_share", 0.02)),
-    )
-    gabagool_endgame_seconds = int(
-        _cfg_get(raw, defaults, "gabagool_endgame_seconds", default=30)
-    )
-    gabagool_endgame_max_unpaired = _parse_max_shares(
-        "gabagool_endgame_max_unpaired",
-        _cfg_get(raw, defaults, "gabagool_endgame_max_unpaired"),
-        float(defaults.get("gabagool_endgame_max_unpaired", 1.0)),
-    )
     if gabagool_min_time_to_resolution < 0:
         _fatal(f"{asset}:{window}: gabagool_min_time_to_resolution must be >= 0")
     if gabagool_price_buffer < 0 or gabagool_price_buffer > 0.05:
         _fatal(f"{asset}:{window}: gabagool_price_buffer must be between 0 and 0.05")
     if gabagool_min_profit_margin >= 1:
         _fatal(f"{asset}:{window}: gabagool_min_profit_margin must be < 1")
-    if gabagool_hedge_max_pair_cost > 1.0 + 1e-9:
-        _fatal(f"{asset}:{window}: gabagool_hedge_max_pair_cost must be <= 1.0")
-    if gabagool_inventory_soft_limit > gabagool_max_unpaired_shares + 1e-9:
-        _fatal(
-            f"{asset}:{window}: gabagool_inventory_soft_limit={gabagool_inventory_soft_limit} "
-            f"cannot exceed gabagool_max_unpaired_shares={gabagool_max_unpaired_shares}"
-        )
-    if gabagool_emergency_unwind_imbalance > gabagool_max_unpaired_shares + 1e-9:
-        _fatal(
-            f"{asset}:{window}: gabagool_emergency_unwind_imbalance={gabagool_emergency_unwind_imbalance} "
-            f"cannot exceed gabagool_max_unpaired_shares={gabagool_max_unpaired_shares}"
-        )
-    if gabagool_endgame_seconds < 0:
-        _fatal(f"{asset}:{window}: gabagool_endgame_seconds must be >= 0")
-    if gabagool_endgame_max_unpaired > gabagool_max_unpaired_shares + 1e-9:
-        _fatal(
-            f"{asset}:{window}: gabagool_endgame_max_unpaired={gabagool_endgame_max_unpaired} "
-            f"cannot exceed gabagool_max_unpaired_shares={gabagool_max_unpaired_shares}"
-        )
     if gabagool_max_pair_cost > 1.0 - gabagool_min_profit_margin + 1e-9:
         _fatal(
             f"{asset}:{window}: gabagool_max_pair_cost={gabagool_max_pair_cost} "
@@ -454,12 +401,6 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         gabagool_max_unpaired_shares=gabagool_max_unpaired_shares,
         gabagool_min_time_to_resolution=gabagool_min_time_to_resolution,
         gabagool_price_buffer=gabagool_price_buffer,
-        gabagool_inventory_soft_limit=gabagool_inventory_soft_limit,
-        gabagool_hedge_max_pair_cost=gabagool_hedge_max_pair_cost,
-        gabagool_emergency_unwind_imbalance=gabagool_emergency_unwind_imbalance,
-        gabagool_emergency_max_loss_per_share=gabagool_emergency_max_loss_per_share,
-        gabagool_endgame_seconds=gabagool_endgame_seconds,
-        gabagool_endgame_max_unpaired=gabagool_endgame_max_unpaired,
         trade_cooldown_ms=trade_cooldown_ms,
         order_size_min=order_size_min,
         order_size_max=order_size_max,
