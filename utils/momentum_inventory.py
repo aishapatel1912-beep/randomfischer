@@ -1,78 +1,139 @@
-"""Per-worker YES/NO position inventory for momentum trading."""
+"""Small, dependency-free inventory ledger used by the trading engines.
+
+The ledger tracks weighted-average entry cost separately for YES and NO.
+SELLs realize PnL against that side's weighted-average cost.  Matched pairs
+are informational: one YES + one NO share can redeem for $1 at resolution.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Dict
+
+
+_EPS = 1e-12
+_VALID_SIDES = ("YES", "NO")
 
 
 @dataclass
-class PositionInventory:
-    yes_shares: float = 0.0
-    no_shares: float = 0.0
-    yes_cost: float = 0.0
-    no_cost: float = 0.0
-
-    def shares(self, side: str) -> float:
-        return self.yes_shares if side == "YES" else self.no_shares
-
-    def headroom(self, side: str, max_shares: float) -> float:
-        return max(0.0, max_shares - self.shares(side))
-
-    def record_buy(self, side: str, shares: float, price: float) -> None:
-        if shares <= 0 or price <= 0:
-            return
-        cost = shares * price
-        if side == "YES":
-            self.yes_shares += shares
-            self.yes_cost += cost
-        else:
-            self.no_shares += shares
-            self.no_cost += cost
-
-    def record_sell(self, side: str, shares: float, price: float) -> float:
-        """Reduce position after exit; return realized PnL on sold shares."""
-        if shares <= 0 or price <= 0:
-            return 0.0
-        avg = self.avg_cost(side)
-        if side == "YES":
-            sold = min(shares, self.yes_shares)
-            if sold <= 0:
-                return 0.0
-            cost = sold * avg
-            pnl = sold * price - cost
-            self.yes_shares -= sold
-            self.yes_cost -= cost
-            if self.yes_shares <= 1e-9:
-                self.yes_shares = 0.0
-                self.yes_cost = 0.0
-            return round(pnl, 4)
-        sold = min(shares, self.no_shares)
-        if sold <= 0:
-            return 0.0
-        cost = sold * avg
-        pnl = sold * price - cost
-        self.no_shares -= sold
-        self.no_cost -= cost
-        if self.no_shares <= 1e-9:
-            self.no_shares = 0.0
-            self.no_cost = 0.0
-        return round(pnl, 4)
+class _Lot:
+    shares: float = 0.0
+    cost: float = 0.0  # total dollar cost of currently held shares
 
     @property
-    def imbalance(self) -> float:
-        return self.yes_shares - self.no_shares
+    def avg_cost(self) -> float:
+        return self.cost / self.shares if self.shares > _EPS else 0.0
+
+
+class PositionInventory:
+    """Weighted-average inventory for a binary UP/DOWN market."""
+
+    def __init__(self) -> None:
+        self._lots: Dict[str, _Lot] = {side: _Lot() for side in _VALID_SIDES}
+        self.realized_pnl: float = 0.0
+        self.total_bought: float = 0.0
+        self.total_sold: float = 0.0
+
+    @staticmethod
+    def _side(side: str) -> str:
+        s = str(side).upper().strip()
+        if s not in _VALID_SIDES:
+            raise ValueError(f"invalid inventory side: {side!r}")
+        return s
+
+    def shares(self, side: str) -> float:
+        return max(0.0, self._lots[self._side(side)].shares)
+
+    def avg_cost(self, side: str) -> float:
+        return self._lots[self._side(side)].avg_cost
+
+    def cost_basis(self, side: str) -> float:
+        return max(0.0, self._lots[self._side(side)].cost)
+
+    def headroom(self, side: str, max_shares: float) -> float:
+        return max(0.0, float(max_shares) - self.shares(side))
+
+    @property
+    def yes_shares(self) -> float:
+        return self.shares("YES")
+
+    @property
+    def no_shares(self) -> float:
+        return self.shares("NO")
 
     @property
     def matched_pairs(self) -> float:
         return min(self.yes_shares, self.no_shares)
 
-    def avg_cost(self, side: str) -> float:
-        if side == "YES":
-            return self.yes_cost / self.yes_shares if self.yes_shares > 0 else 0.0
-        return self.no_cost / self.no_shares if self.no_shares > 0 else 0.0
+    @property
+    def unpaired_yes(self) -> float:
+        return max(0.0, self.yes_shares - self.no_shares)
+
+    @property
+    def unpaired_no(self) -> float:
+        return max(0.0, self.no_shares - self.yes_shares)
+
+    @property
+    def unpaired_shares(self) -> float:
+        return abs(self.yes_shares - self.no_shares)
+
+    def record_buy(self, side: str, shares: float, price: float) -> None:
+        s = self._side(side)
+        qty = float(shares)
+        px = float(price)
+        if qty <= 0:
+            return
+        if px < 0 or px > 1:
+            raise ValueError(f"buy price must be between 0 and 1: {price}")
+        lot = self._lots[s]
+        lot.cost += qty * px
+        lot.shares += qty
+        self.total_bought += qty
+
+    def record_sell(self, side: str, shares: float, price: float) -> float:
+        """Remove shares and return realized PnL for the sale."""
+        s = self._side(side)
+        qty = float(shares)
+        px = float(price)
+        if qty <= 0:
+            return 0.0
+        if px < 0 or px > 1:
+            raise ValueError(f"sell price must be between 0 and 1: {price}")
+
+        lot = self._lots[s]
+        qty = min(qty, lot.shares)
+        if qty <= _EPS:
+            return 0.0
+
+        avg = lot.avg_cost
+        cost_removed = avg * qty
+        proceeds = px * qty
+        pnl = proceeds - cost_removed
+
+        lot.shares -= qty
+        lot.cost -= cost_removed
+        if lot.shares <= _EPS:
+            lot.shares = 0.0
+            lot.cost = 0.0
+
+        self.realized_pnl += pnl
+        self.total_sold += qty
+        return pnl
+
+    def mark_to_market(self, side: str, price: float) -> float:
+        return (float(price) - self.avg_cost(side)) * self.shares(side)
 
     def reset(self) -> None:
-        self.yes_shares = 0.0
-        self.no_shares = 0.0
-        self.yes_cost = 0.0
-        self.no_cost = 0.0
+        self._lots = {side: _Lot() for side in _VALID_SIDES}
+        self.realized_pnl = 0.0
+        self.total_bought = 0.0
+        self.total_sold = 0.0
+
+    def snapshot(self) -> dict:
+        return {
+            "YES": {"shares": self.yes_shares, "avg_cost": self.avg_cost("YES")},
+            "NO": {"shares": self.no_shares, "avg_cost": self.avg_cost("NO")},
+            "matched_pairs": self.matched_pairs,
+            "unpaired_shares": self.unpaired_shares,
+            "realized_pnl": self.realized_pnl,
+        }

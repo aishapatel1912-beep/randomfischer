@@ -1,68 +1,67 @@
-"""Pure helpers for momentum entry and stop-loss validation."""
+"""Execution-window and order-risk helpers.
+
+These functions intentionally stay small and deterministic so they can be
+used by both the momentum and three-engine execution paths.
+"""
 
 from __future__ import annotations
 
-from typing import Callable, Optional
-
-
-def side_meets_entry_threshold(price: float, threshold: float) -> bool:
-    """Return True when a side's bid meets the momentum entry floor."""
-    return price >= threshold
-
-
-def stop_loss_triggered(current: float, entry: float, stop_loss_pct: float) -> bool:
-    """Return True when current price has fallen stop_loss_pct below entry."""
-    if entry <= 0 or current <= 0:
-        return False
-    return current <= entry * (1.0 - stop_loss_pct)
-
-
-def stop_loss_price(entry: float, stop_loss_pct: float) -> float:
-    return round(entry * (1.0 - stop_loss_pct), 4)
-
-
-def is_market_locked(
-    yes_price: float,
-    no_price: float,
-    *,
-    is_locked: Callable[[float], bool],
-) -> bool:
-    """Skip markets where either side is at a resolved/locked price."""
-    if yes_price > 0 and is_locked(yes_price):
-        return True
-    if no_price > 0 and is_locked(no_price):
-        return True
-    return False
-
-
-def pick_momentum_side(
-    yes_bid: float,
-    no_bid: float,
-    threshold: float,
-    *,
-    is_locked: Callable[[float], bool],
-) -> Optional[tuple[str, float]]:
-    """Return the side with the highest qualifying bid, or None."""
-    candidates: list[tuple[str, float]] = []
-    for side, bid in (("YES", yes_bid), ("NO", no_bid)):
-        if bid <= 0 or is_locked(bid):
-            continue
-        if side_meets_entry_threshold(bid, threshold):
-            candidates.append((side, bid))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda item: item[1])
+import math
 
 
 def entry_window_ok(
-    seconds_left: int,
+    seconds_left: float,
     *,
-    entry_seconds_left: int,
-    min_entry_seconds_left: int,
+    entry_seconds_left: float,
+    min_entry_seconds_left: float = 0.0,
 ) -> bool:
-    """Entry allowed when within the configured time window."""
-    return min_entry_seconds_left < seconds_left <= entry_seconds_left
+    """Return True when a new entry is inside the configured market window.
+
+    ``entry_seconds_left`` is the maximum number of seconds remaining at which
+    entries are allowed.  A non-positive value disables that upper bound.
+    ``min_entry_seconds_left`` protects against entering too close to expiry.
+    """
+    try:
+        left = float(seconds_left)
+        upper = float(entry_seconds_left)
+        lower = float(min_entry_seconds_left)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(left):
+        return False
+    if left <= 0 or left < lower:
+        return False
+    if upper > 0 and left > upper:
+        return False
+    return True
 
 
-def is_order_fully_filled(requested: float, filled: float, min_delta: float) -> bool:
-    return filled >= requested - min_delta
+def is_order_fully_filled(
+    requested: float,
+    filled: float,
+    min_fill_delta: float = 0.0,
+) -> bool:
+    try:
+        req = float(requested)
+        got = float(filled)
+        tol = max(0.0, float(min_fill_delta))
+    except (TypeError, ValueError):
+        return False
+    if req <= 0:
+        return False
+    return got >= max(0.0, req - tol)
+
+
+def stop_loss_price(entry_price: float, stop_loss_pct: float) -> float:
+    entry = float(entry_price)
+    pct = max(0.0, float(stop_loss_pct))
+    return max(0.0, min(1.0, entry * (1.0 - pct)))
+
+
+def stop_loss_triggered(current_price: float, entry_price: float, stop_loss_pct: float) -> bool:
+    try:
+        current = float(current_price)
+        stop = stop_loss_price(entry_price, stop_loss_pct)
+    except (TypeError, ValueError):
+        return False
+    return current <= stop
