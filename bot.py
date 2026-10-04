@@ -3264,10 +3264,13 @@ class MarketWorker:
         ask = self.best_ask(side)
         if px <= 0 or ask <= 0 or is_locked_price(px) or is_locked_price(ask):
             return False
-        if px + 1e-9 < ask:
+        # First leg must execute against the live ask. A hedge leg is allowed
+        # to rest below the ask because its entire purpose is to wait for the
+        # opposite token to become cheap enough to lock the pair.
+        if decision.first_leg and px + 1e-9 < ask:
             print(
                 f"❌ [GABAGOOL ABORT] {self.asset_type.upper()} {self.window_slug} | "
-                f"limit={round(px*100)}c is below live ask={round(ask*100)}c"
+                f"first-leg limit={round(px*100)}c is below live ask={round(ask*100)}c"
             )
             return False
         if self.market_seconds_left() < cfg.gabagool_min_time_to_resolution:
@@ -3594,12 +3597,18 @@ class MarketWorker:
             if abs(self.inventory.shares("YES") - self.inventory.shares("NO")) <= 1e-9:
                 return []
 
-        # The strategy already computed a safe 1-cent limit. Re-quote only if
-        # the live ask has not moved beyond that limit.
-        executable = math.ceil((ask - 1e-9) * 100.0) / 100.0
-        executable = round(executable, 2)
-        if executable > decision.price + 1e-9:
-            return []
+        if decision.first_leg:
+            # First leg is an immediate/taker-style high-confidence entry.
+            executable = math.ceil((ask - 1e-9) * 100.0) / 100.0
+            executable = round(executable, 2)
+            if executable > decision.price + 1e-9:
+                return []
+        else:
+            # Hedge leg is deliberately passive. Keep the exact safe ceiling
+            # from the strategy rather than chasing the live ask upward.
+            executable = round(decision.price, 2)
+            if executable <= 0 or executable >= 1.0:
+                return []
 
         inv = self.inventory
         current = inv.shares(side)
@@ -4160,7 +4169,7 @@ class MarketWorker:
             f"⏳ [GABAGOOL IDLE] {self.asset_type.upper()} {self.window_slug} | "
             f"YES ask={round(self.best_ask("YES")*100)}c "
             f"NO ask={round(self.best_ask("NO")*100)}c | "
-            f"first<={round(cfg.gabagool_initial_entry_threshold*100)}c "
+            f"first>={round(cfg.gabagool_initial_entry_threshold*100)}c "
             f"pair<={round(cfg.gabagool_max_pair_cost*100)}c | "
             f"inv Y={inv.yes_shares:.0f} N={inv.no_shares:.0f} entries={self.entry_count}"
         )
@@ -4790,7 +4799,7 @@ class MarketWorker:
               f"{self.asset_type.upper()} {self.window_slug} markets...")
         print(f"  Market interval   : {self.window_slug} ({wc.interval_seconds}s)")
         print(f"  Listener window   : final {wc.listener_activate_secs}s")
-        print(f"  First-leg ceiling : {wc.gabagool_initial_entry_threshold:.3f} "
+        print(f"  High-confidence first-leg range : {wc.gabagool_initial_entry_threshold:.3f} "
               f"({wc.gabagool_initial_entry_threshold*100:.1f}c ask)")
         print(f"  Pair-cost ceiling : {wc.gabagool_max_pair_cost:.3f} "
               f"({wc.gabagool_max_pair_cost*100:.1f}c combined avg)")
@@ -5160,7 +5169,7 @@ if __name__ == "__main__":
     try:
         print("🚀 Starting EmilianoBot — Arbigab-style 3-engine architecture...")
         for wc in WORKER_CONFIGS:
-            print(f"   {wc.asset.upper()} {wc.window}: first<={wc.gabagool_initial_entry_threshold:.3f} "
+            print(f"   {wc.asset.upper()} {wc.window}: first>={wc.gabagool_initial_entry_threshold:.3f} "
                   f"| pair<={wc.gabagool_max_pair_cost:.3f} | order={wc.order_size} "
                   f"| max={wc.max_shares}/leg | dry_run={wc.dry_run}")
         asyncio.run(main())

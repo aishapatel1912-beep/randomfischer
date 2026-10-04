@@ -1,8 +1,10 @@
 """Inventory-aware Gabagool-style paired accumulation for Polymarket crypto UP/DOWN markets.
 
 Core behavior:
-  * First position: only take a genuinely cheap leg.
-  * Once inventory exists: the underweight leg has absolute priority.
+  * First position: only take a high-confidence leg at or above the configured 90c entry floor.
+  * Once the first leg fills: only buy the opposite hedge, at the maximum price
+    that keeps the completed YES+NO pair below the configured pair ceiling.
+  * A hedge may rest below the current ask; the bot does not chase a falling knife.
   * A normal hedge must preserve the normal pair-cost ceiling.
   * A stressed hedge may use a slightly looser rescue ceiling so a cheap first
     leg cannot strand the worker indefinitely with naked inventory.
@@ -41,15 +43,24 @@ class GabagoolStrategy:
         yes_ask: float,
         no_ask: float,
         threshold: float,
+        max_entry: float,
     ) -> Optional[Tuple[str, float]]:
+        """Choose the stronger side, not the cheaper side.
+
+        The old 49c rule entered whichever token was cheap. That is exactly
+        the falling-knife failure mode this strategy is meant to avoid. The
+        new rule enters only when a side is already priced at/above the high-
+        confidence floor (90c by default).
+        """
         candidates = []
-        if 0 < yes_ask <= threshold + _EPS:
+        if threshold <= yes_ask <= max_entry + _EPS:
             candidates.append(("YES", yes_ask))
-        if 0 < no_ask <= threshold + _EPS:
+        if threshold <= no_ask <= max_entry + _EPS:
             candidates.append(("NO", no_ask))
         if not candidates:
             return None
-        return min(candidates, key=lambda x: x[1])
+        # Prefer the stronger/highest-probability side.
+        return max(candidates, key=lambda x: x[1])
 
     @staticmethod
     def _round_up_tick(price: float) -> float:
@@ -115,50 +126,59 @@ class GabagoolStrategy:
             return None
 
         if yes_shares <= _EPS and no_shares <= _EPS:
+            # FIRST LEG: buy only a high-confidence side (90c by default).
+            # We do not buy the cheap side anymore.
+            # Leave at least one cent of room for the opposite token. With a
+            # 98c pair ceiling, the first leg can therefore be no higher than
+            # 97c; at 90c it needs an 8c-or-better hedge to lock the 2c edge.
+            max_first_entry = min(0.99, cfg.gabagool_max_pair_cost - 0.01)
             picked = self._select_first_side(
                 yes_ask, no_ask, cfg.gabagool_initial_entry_threshold,
+                max_first_entry,
             )
             if picked is None:
                 return None
             side, ask = picked
             if cfg.gabagool_falling_knife_enabled and worker.is_falling_knife(side, ask):
+                print(
+                    f"🛑 [GABAGOOL 90C BLOCK] {worker.asset_type.upper()} "
+                    f"{worker.window_slug} | {side}={round(ask*100)}c "
+                    f"is falling; waiting for stabilization"
+                )
                 return None
             first_leg = True
             opposite_shares = 0.0
             opposite_avg = 0.0
-            target_price = cfg.gabagool_initial_entry_threshold
-            reason = "first_cheap_leg"
+            target_price = 0.99
+            reason = "first_high_confidence_leg"
         else:
             first_leg = False
 
-            # Inventory is the primary constraint. If we are even slightly
-            # outside the soft band, ONLY the underweight side is eligible.
+            # Once a first leg exists, ONLY the opposite side may be bought.
+            # Never add to the already-overweight leg.
             if imbalance > _EPS:
                 side = "NO"
-                reason = "inventory_hedge_no"
+                reason = "hedge_yes_with_no"
             elif imbalance < -_EPS:
                 side = "YES"
-                reason = "inventory_hedge_yes"
+                reason = "hedge_no_with_yes"
             else:
-                side = "YES" if yes_ask <= no_ask else "NO"
-                reason = "balanced_cheap_leg"
-                if cfg.gabagool_falling_knife_enabled and worker.is_falling_knife(
-                    side, yes_ask if side == "YES" else no_ask,
-                ):
-                    return None
+                # A balanced pair is already complete. Do not start another
+                # cycle unless the previous pair has been fully secured.
+                return None
 
             ask = yes_ask if side == "YES" else no_ask
             opposite = "NO" if side == "YES" else "YES"
             opposite_shares, opposite_avg = self._leg(worker, opposite)
+            if opposite_shares <= _EPS or opposite_avg <= 0:
+                return None
 
-            # Normal hedging is strict. Once the worker is outside the soft
-            # inventory band, use the rescue ceiling instead of simply giving
-            # up and leaving the original leg naked forever.
-            if opposite_shares > _EPS and opposite_avg > 0:
-                stressed = abs_imbalance > cfg.gabagool_inventory_soft_limit + _EPS
-                target_price = self._hedge_ceiling(worker, opposite_avg, stressed)
-            else:
-                target_price = cfg.gabagool_initial_entry_threshold
+            # The hedge is NOT chased. Calculate the maximum price we can pay
+            # for the opposite side and still lock the configured gross edge.
+            stressed = abs_imbalance > cfg.gabagool_inventory_soft_limit + _EPS
+            target_price = self._hedge_ceiling(worker, opposite_avg, stressed)
+            if target_price < 0.01 - _EPS:
+                return None
 
         if target_price <= 0 or ask <= 0:
             return None
@@ -175,11 +195,21 @@ class GabagoolStrategy:
         if projected_unpaired > unpaired_limit + _EPS:
             return None
 
-        executable_price = self._round_up_tick(ask + cfg.gabagool_price_buffer)
-        executable_price = min(executable_price, target_price)
-        executable_price = round(executable_price, 2)
-        if executable_price + _EPS < ask:
-            return None
+        if first_leg:
+            # Cross the current ask for the high-confidence first leg.
+            executable_price = self._round_up_tick(ask + cfg.gabagool_price_buffer)
+            executable_price = min(executable_price, target_price)
+            executable_price = round(executable_price, 2)
+            if executable_price + _EPS < ask:
+                return None
+        else:
+            # Hedge leg: place a resting GTC at the safe price. If the ask is
+            # already there, it can fill immediately; if not, we wait for the
+            # opposite side to become cheap enough. This is the key anti-chase
+            # protection against the falling-knife problem.
+            executable_price = round(target_price, 2)
+            if executable_price < 0.01:
+                return None
 
         current_avg = yes_avg if side == "YES" else no_avg
         projected_avg = (

@@ -179,7 +179,7 @@ class WorkerConfig:
     # Legacy fields kept for dashboard/backward compatibility. Gabagool does not use them for entries/exits.
     momentum_entry_threshold: float = 0.90
     stop_loss_pct: float = 0.35
-    gabagool_initial_entry_threshold: float = 0.49
+    gabagool_initial_entry_threshold: float = 0.90
     gabagool_max_pair_cost: float = 0.98
     gabagool_min_profit_margin: float = 0.02
     gabagool_max_unpaired_shares: float = 5.0
@@ -293,7 +293,7 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     gabagool_initial_entry_threshold = _parse_unit_fraction(
         "gabagool_initial_entry_threshold",
         _cfg_get(raw, defaults, "gabagool_initial_entry_threshold"),
-        float(defaults.get("gabagool_initial_entry_threshold", 0.49)),
+        float(defaults.get("gabagool_initial_entry_threshold", 0.90)),
     )
     gabagool_max_pair_cost = _parse_unit_fraction(
         "gabagool_max_pair_cost",
