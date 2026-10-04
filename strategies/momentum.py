@@ -55,6 +55,20 @@ class GabagoolStrategy:
     def _round_up_tick(price: float) -> float:
         return math.ceil((price - _EPS) * 100.0) / 100.0
 
+    @staticmethod
+    def _hedge_ceiling(worker: "MarketWorker", opposite_avg: float, stressed: bool) -> float:
+        """Maximum executable price for the underweight hedge.
+
+        Inventory reduction is not enough by itself: the hedge must also be
+        economically acceptable.  The configured pair ceiling is capped by
+        an explicit maximum loss per share on the completed pair.
+        """
+        cfg = worker.worker_config
+        rescue_ceiling = cfg.gabagool_hedge_max_pair_cost if stressed else cfg.gabagool_max_pair_cost
+        loss_ceiling = 1.0 - cfg.gabagool_max_hedge_loss_per_share
+        pair_ceiling = min(rescue_ceiling, loss_ceiling)
+        return max(0.0, pair_ceiling - max(0.0, opposite_avg))
+
     async def evaluate(self, worker: "MarketWorker") -> Optional[GabagoolDecision]:
         from bot import OrderState, is_locked_price
 
@@ -141,12 +155,8 @@ class GabagoolStrategy:
             # inventory band, use the rescue ceiling instead of simply giving
             # up and leaving the original leg naked forever.
             if opposite_shares > _EPS and opposite_avg > 0:
-                pair_ceiling = (
-                    cfg.gabagool_hedge_max_pair_cost
-                    if abs_imbalance > cfg.gabagool_inventory_soft_limit + _EPS
-                    else cfg.gabagool_max_pair_cost
-                )
-                target_price = pair_ceiling - opposite_avg
+                stressed = abs_imbalance > cfg.gabagool_inventory_soft_limit + _EPS
+                target_price = self._hedge_ceiling(worker, opposite_avg, stressed)
             else:
                 target_price = cfg.gabagool_initial_entry_threshold
 
@@ -179,10 +189,10 @@ class GabagoolStrategy:
         projected_pair_cost = 0.0
         if opposite_shares > _EPS and opposite_avg > 0:
             projected_pair_cost = projected_avg + opposite_avg
-            pair_ceiling = (
-                cfg.gabagool_hedge_max_pair_cost
-                if abs_imbalance > cfg.gabagool_inventory_soft_limit + _EPS
-                else cfg.gabagool_max_pair_cost
+            stressed = abs_imbalance > cfg.gabagool_inventory_soft_limit + _EPS
+            pair_ceiling = min(
+                cfg.gabagool_hedge_max_pair_cost if stressed else cfg.gabagool_max_pair_cost,
+                1.0 - cfg.gabagool_max_hedge_loss_per_share,
             )
             if projected_pair_cost > pair_ceiling + _EPS:
                 return None

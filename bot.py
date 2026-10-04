@@ -2766,6 +2766,7 @@ class MarketWorker:
             "gabagool_min_time_to_resolution": worker_config.gabagool_min_time_to_resolution,
             "gabagool_inventory_soft_limit": worker_config.gabagool_inventory_soft_limit,
             "gabagool_hedge_max_pair_cost_c": round(worker_config.gabagool_hedge_max_pair_cost * 100, 1),
+            "gabagool_max_hedge_loss_per_share_c": round(worker_config.gabagool_max_hedge_loss_per_share * 100, 2),
             "gabagool_emergency_unwind_imbalance": worker_config.gabagool_emergency_unwind_imbalance,
             "gabagool_endgame_seconds": worker_config.gabagool_endgame_seconds,
             "gabagool_endgame_max_unpaired": worker_config.gabagool_endgame_max_unpaired,
@@ -3063,12 +3064,17 @@ class MarketWorker:
         return cfg.gabagool_max_pair_cost
 
     async def _manage_gabagool_inventory(self) -> bool:
-        """Prevent a cheap first leg from turning into a large naked position.
+        """Manage existing skew without converting it into a forced loss.
 
-        Returns True when this tick was consumed by an inventory-risk action.
-        The normal path is to let the strategy buy the underweight side. If the
-        hedge is no longer economically available, an overweight unpaired leg
-        is reduced with a tightly bounded FOK sell.
+        Rules:
+          1. Inventory imbalance never forces a hedge by itself.
+          2. Hedge only when the live opposite ask keeps the completed pair
+             within both the pair-cost ceiling and the explicit hedge-loss cap.
+          3. If the hedge is too expensive and the overweight leg is in a
+             falling knife, reduce the unpaired leg rather than buying the
+             expensive opposite side.
+          4. If there is no knife, wait until the configured emergency skew
+             before realizing a bounded loss.
         """
         cfg = self.worker_config
         inv = self.inventory
@@ -3079,57 +3085,76 @@ class MarketWorker:
         if abs_imbalance <= cfg.gabagool_inventory_soft_limit + 1e-9:
             return False
 
+        overweight = "YES" if imbalance > 0 else "NO"
+        underweight = "NO" if overweight == "YES" else "YES"
+        overweight_avg = float(inv.avg_cost(overweight))
+        hedge_ask = self.best_ask(underweight)
+        executable_hedge = (
+            math.ceil((hedge_ask - 1e-9) * 100.0) / 100.0
+            if hedge_ask > 0 else 0.0
+        )
+        stressed_ceiling = cfg.gabagool_hedge_max_pair_cost
+        loss_ceiling = 1.0 - cfg.gabagool_max_hedge_loss_per_share
+        pair_ceiling = min(stressed_ceiling, loss_ceiling)
+        max_hedge_price = pair_ceiling - overweight_avg
+
+        # This is the key economic-risk test. A hedge is allowed only if it
+        # actually produces an acceptable completed pair.
+        hedge_ok = (
+            hedge_ask > 0
+            and not is_locked_price(hedge_ask)
+            and executable_hedge <= max_hedge_price + 1e-9
+        )
+        if hedge_ok:
+            return False
+
         seconds_left = self.market_seconds_left()
         endgame = seconds_left <= cfg.gabagool_endgame_seconds
-        hard_limit = cfg.gabagool_endgame_max_unpaired if endgame else cfg.gabagool_max_unpaired_shares
-        if abs_imbalance <= hard_limit + 1e-9:
-            # The strategy gets first chance to buy the underweight side.
-            under = "NO" if imbalance > 0 else "YES"
-            ask = self.best_ask(under)
-            overweight = "YES" if imbalance > 0 else "NO"
-            overweight_avg = inv.avg_cost(overweight)
-            ceiling = cfg.gabagool_hedge_max_pair_cost
-            max_hedge_price = ceiling - overweight_avg
-            executable = math.ceil((ask - 1e-9) * 100.0) / 100.0 if ask > 0 else 0.0
-            if ask > 0 and executable <= max_hedge_price + 1e-9:
-                return False
 
-        # If the hedge cannot be bought cheaply enough, do not let the naked
-        # leg sit there indefinitely. Only unwind the genuinely unpaired part.
-        if (not endgame) and abs_imbalance < cfg.gabagool_emergency_unwind_imbalance - 1e-9:
-            return False
-        if endgame and abs_imbalance <= cfg.gabagool_endgame_max_unpaired + 1e-9:
-            return False
+        # If the overweight side itself is falling rapidly, do not wait for a
+        # larger numerical imbalance. This is the actual falling-knife escape
+        # hatch: exit the bad unpaired leg if the loss remains bounded.
+        knife = False
+        if cfg.gabagool_falling_knife_enabled:
+            knife = self.is_falling_knife(overweight, self.best_ask(overweight))
 
-        overweight = "YES" if imbalance > 0 else "NO"
-        shares = max(0.0, abs_imbalance)
-        bid = self.best_bid(overweight)
-        if shares <= MIN_FILL_DELTA or bid <= 0 or is_locked_price(bid):
-            return False
+        should_unwind = knife or abs_imbalance >= cfg.gabagool_emergency_unwind_imbalance - 1e-9
+        if endgame and abs_imbalance > cfg.gabagool_endgame_max_unpaired + 1e-9:
+            should_unwind = True
 
-        avg = inv.avg_cost(overweight)
-        allowed_loss = cfg.gabagool_emergency_max_loss_per_share
-        # In the final seconds, carrying inventory through resolution is more
-        # dangerous than realizing a small controlled loss, so use the same
-        # configured cap rather than widening it silently.
-        if bid + allowed_loss + 1e-9 < avg:
+        if not should_unwind:
             print(
-                f"⚠️ [GABAGOOL RISK] {self.asset_type.upper()} {self.window_slug} | "
-                f"imbalance={abs_imbalance:.2f} {overweight} | "
-                f"bid={bid:.2f} avg={avg:.2f} — hedge too expensive and unwind "
-                f"would exceed loss cap; HOLD, do not add exposure"
+                f"🛑 [GABAGOOL RISK] {self.asset_type.upper()} {self.window_slug} | "
+                f"{overweight} overweight={abs_imbalance:.2f} | "
+                f"hedge {underweight} ask={hedge_ask:.3f} > max={max_hedge_price:.3f} | "
+                f"{'FALLING KNIFE' if knife else 'WAIT'} — no forced hedge"
             )
             return True
 
-        sell_size = min(shares, cfg.max_order_size, cfg.max_shares)
-        sell_size = round(sell_size, 4)
-        if sell_size <= MIN_FILL_DELTA:
-            return False
+        shares = max(0.0, abs_imbalance)
+        bid = self.best_bid(overweight)
+        if shares <= MIN_FILL_DELTA or bid <= 0 or is_locked_price(bid):
+            return True
 
+        avg = overweight_avg
+        allowed_loss = cfg.gabagool_emergency_max_loss_per_share
+        if bid + allowed_loss + 1e-9 < avg:
+            print(
+                f"⚠️ [GABAGOOL RISK] {self.asset_type.upper()} {self.window_slug} | "
+                f"{overweight} knife={knife} bid={bid:.3f} avg={avg:.3f} | "
+                f"unwind exceeds loss cap; HOLD, do not buy {underweight}"
+            )
+            return True
+
+        sell_size = round(min(shares, cfg.max_order_size, cfg.max_shares), 4)
+        if sell_size <= MIN_FILL_DELTA:
+            return True
+
+        reason = "falling_knife_unwind" if knife else "hedge_unavailable_emergency_unwind"
         print(
             f"🛡️ [GABAGOOL RISK] {self.asset_type.upper()} {self.window_slug} | "
-            f"unwinding {sell_size:.2f} {overweight} @ {round(bid*100)}c | "
-            f"imbalance={abs_imbalance:.2f} avg={avg:.2f} max_loss={allowed_loss:.2f}"
+            f"SELL {sell_size:.2f} {overweight} @ {round(bid*100)}c | "
+            f"imbalance={abs_imbalance:.2f} avg={avg:.3f} reason={reason}"
         )
 
         if self.is_dry_run():
@@ -3150,7 +3175,9 @@ class MarketWorker:
             "exit_price": fill_price,
             "imbalance_before": imbalance,
             "imbalance_after": yes - no - (fill_size if overweight == "YES" else -fill_size),
-            "reason": "hedge_unavailable_within_pair_cost",
+            "reason": reason,
+            "hedge_ask": hedge_ask,
+            "max_hedge_price": max_hedge_price,
         })
         print(
             f"  🛡️ [GABAGOOL RISK] sold {fill_size:.2f} {overweight} @ "
@@ -3194,6 +3221,7 @@ class MarketWorker:
         if other_avg > 0:
             projected_pair = projected_avg + other_avg
             pair_ceiling = self._gabagool_pair_ceiling()
+            pair_ceiling = min(pair_ceiling, 1.0 - cfg.gabagool_max_hedge_loss_per_share)
             if projected_pair > pair_ceiling + 1e-9:
                 print(
                     f"❌ [GABAGOOL ABORT] projected pair="
@@ -3429,6 +3457,7 @@ class MarketWorker:
         self.dashboard["gabagool_min_time_to_resolution"] = wc.gabagool_min_time_to_resolution
         self.dashboard["gabagool_inventory_soft_limit"] = wc.gabagool_inventory_soft_limit
         self.dashboard["gabagool_hedge_max_pair_cost_c"] = round(wc.gabagool_hedge_max_pair_cost * 100, 1)
+        self.dashboard["gabagool_max_hedge_loss_per_share_c"] = round(wc.gabagool_max_hedge_loss_per_share * 100, 2)
         self.dashboard["gabagool_emergency_unwind_imbalance"] = wc.gabagool_emergency_unwind_imbalance
         self.dashboard["gabagool_endgame_seconds"] = wc.gabagool_endgame_seconds
         self.dashboard["gabagool_endgame_max_unpaired"] = wc.gabagool_endgame_max_unpaired
@@ -3517,7 +3546,11 @@ class MarketWorker:
             projected_avg = (
                 (current * current_avg) + (decision.size * executable)
             ) / max(current + decision.size, 1e-9)
-            if projected_avg + other_avg > self._gabagool_pair_ceiling() + 1e-9:
+            execution_ceiling = min(
+                self._gabagool_pair_ceiling(),
+                1.0 - cfg.gabagool_max_hedge_loss_per_share,
+            )
+            if projected_avg + other_avg > execution_ceiling + 1e-9:
                 return []
 
         return [(side, executable)]
@@ -4284,6 +4317,7 @@ class MarketWorker:
             "gabagool_min_time_to_resolution": wc.gabagool_min_time_to_resolution,
             "gabagool_inventory_soft_limit": wc.gabagool_inventory_soft_limit,
             "gabagool_hedge_max_pair_cost": wc.gabagool_hedge_max_pair_cost,
+            "gabagool_max_hedge_loss_per_share": wc.gabagool_max_hedge_loss_per_share,
             "gabagool_hedge_max_pair_cost_c": round(wc.gabagool_hedge_max_pair_cost * 100, 1),
             "gabagool_emergency_unwind_imbalance": wc.gabagool_emergency_unwind_imbalance,
             "gabagool_emergency_max_loss_per_share": wc.gabagool_emergency_max_loss_per_share,

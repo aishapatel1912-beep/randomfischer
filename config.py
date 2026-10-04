@@ -187,6 +187,10 @@ class WorkerConfig:
     gabagool_price_buffer: float = 0.00
     gabagool_inventory_soft_limit: float = 2.0
     gabagool_hedge_max_pair_cost: float = 0.995
+    # Maximum allowed loss per share when completing an already-open pair.
+    # This prevents an "imbalance hedge" from turning a temporary loss into
+    # a guaranteed large loss (e.g. YES 0.48 + NO 0.60 = 1.08).
+    gabagool_max_hedge_loss_per_share: float = 0.005
     gabagool_emergency_unwind_imbalance: float = 3.0
     gabagool_emergency_max_loss_per_share: float = 0.02
     gabagool_endgame_seconds: int = 30
@@ -301,6 +305,11 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         _cfg_get(raw, defaults, "gabagool_hedge_max_pair_cost"),
         float(defaults.get("gabagool_hedge_max_pair_cost", 0.995)),
     )
+    gabagool_max_hedge_loss_per_share = _parse_unit_fraction(
+        "gabagool_max_hedge_loss_per_share",
+        _cfg_get(raw, defaults, "gabagool_max_hedge_loss_per_share"),
+        float(defaults.get("gabagool_max_hedge_loss_per_share", 0.005)),
+    )
     gabagool_emergency_unwind_imbalance = _parse_nonnegative_float(
         "gabagool_emergency_unwind_imbalance",
         _cfg_get(raw, defaults, "gabagool_emergency_unwind_imbalance"),
@@ -327,6 +336,8 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         _fatal(f"{asset}:{window}: gabagool_min_profit_margin must be < 1")
     if gabagool_hedge_max_pair_cost > 1.0 + 1e-9:
         _fatal(f"{asset}:{window}: gabagool_hedge_max_pair_cost must be <= 1.0")
+    if gabagool_max_hedge_loss_per_share < 0 or gabagool_max_hedge_loss_per_share >= 1.0:
+        _fatal(f"{asset}:{window}: gabagool_max_hedge_loss_per_share must be >= 0 and < 1.0")
     if gabagool_inventory_soft_limit > gabagool_max_unpaired_shares + 1e-9:
         _fatal(
             f"{asset}:{window}: gabagool_inventory_soft_limit={gabagool_inventory_soft_limit} "
@@ -532,6 +543,7 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         gabagool_price_buffer=gabagool_price_buffer,
         gabagool_inventory_soft_limit=gabagool_inventory_soft_limit,
         gabagool_hedge_max_pair_cost=gabagool_hedge_max_pair_cost,
+        gabagool_max_hedge_loss_per_share=gabagool_max_hedge_loss_per_share,
         gabagool_emergency_unwind_imbalance=gabagool_emergency_unwind_imbalance,
         gabagool_emergency_max_loss_per_share=gabagool_emergency_max_loss_per_share,
         gabagool_endgame_seconds=gabagool_endgame_seconds,
