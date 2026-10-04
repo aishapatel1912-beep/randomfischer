@@ -11,7 +11,7 @@
     "gabagool_emergency_unwind_imbalance": 5.0,
     "gabagool_emergency_max_loss_per_share": 0.02,
     "gabagool_endgame_seconds": 30,
-    "gabagool_endgame_max_unpaired": 1.0,
+    "gabagool_endgame_max_unpaired": 5.0,
     "order_size_min": 5,
     "order_size_max": 5,
     "max_order_size": 5,
