@@ -1,6 +1,6 @@
 {
   "defaults": {
-    "gabagool_initial_entry_threshold": 0.49,
+    "gabagool_initial_entry_threshold": 0.90,
     "gabagool_max_pair_cost": 0.98,
     "gabagool_min_profit_margin": 0.02,
     "gabagool_max_unpaired_shares": 5,
@@ -9,7 +9,7 @@
     "gabagool_inventory_soft_limit": 2.0,
     "gabagool_hedge_max_pair_cost": 0.995,
     "gabagool_max_hedge_loss_per_share": 0.005,
-    "gabagool_emergency_unwind_imbalance": 5.0,
+    "gabagool_emergency_unwind_imbalance": 3.0,
     "gabagool_emergency_max_loss_per_share": 0.02,
     "gabagool_endgame_seconds": 30,
     "gabagool_endgame_max_unpaired": 1.0,
@@ -37,7 +37,7 @@
     "momentum_max_position_delta": 5.0,
     "market_making_enabled": true,
     "market_making_quote_size": 5.0,
-    "market_making_min_spread": 0.02,
+    "market_making_min_spread": 0.01,
     "market_making_quote_offset": 0.01,
     "market_making_max_position_delta": 5.0,
     "market_making_requote_seconds": 0.4,
