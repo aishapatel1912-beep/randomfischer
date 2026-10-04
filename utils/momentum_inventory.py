@@ -54,6 +54,21 @@ class PositionInventory:
         return max(0.0, float(max_shares) - self.shares(side))
 
     @property
+    def yes_cost(self) -> float:
+        """Current total dollar cost basis of held YES shares."""
+        return self.cost_basis("YES")
+
+    @property
+    def no_cost(self) -> float:
+        """Current total dollar cost basis of held NO shares."""
+        return self.cost_basis("NO")
+
+    @property
+    def imbalance(self) -> float:
+        """Absolute YES/NO share imbalance."""
+        return abs(self.yes_shares - self.no_shares)
+
+    @property
     def yes_shares(self) -> float:
         return self.shares("YES")
 
