@@ -1,0 +1,6 @@
+virtual_env/
+/__pycache__/
+*.pyc
+.env
+id_rsa_rubinstein
+id_rsa_rubinstein.pub

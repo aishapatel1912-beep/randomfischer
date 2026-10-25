@@ -1,0 +1,46 @@
+{
+  "defaults": {
+    "inventory_accumulation_enabled": true,
+    "cheap_entry_price": 0.35,
+    "initial_hedge_delay_seconds": 10,
+    "combined_cost_target": 0.98,
+    "max_combined_cost": 1.0,
+    "entry_window_seconds": 0,
+    "max_entry_price": 0.35,
+    "order_type": "FOK",
+    "max_slippage": 0.005,
+    "max_quote_age_seconds": 3.0,
+    "max_hedge_retries": 3,
+    "hedge_retry_delay_ms": 400,
+    "max_market_exposure": 80,
+    "max_position_size": 25,
+    "max_unmatched_yes": 25,
+    "max_unmatched_no": 25,
+    "max_share_imbalance": 0,
+    "max_unmatched_shares": 0,
+    "balance_inventory_before_buy": true,
+    "account_for_pending_buy_orders": true,
+    "allow_unmatched_accumulation": false,
+    "min_order_size": 5,
+    "listener_activate_secs": 90,
+    "order_size_min": 5,
+    "order_size_max": 5,
+    "max_order_size": 5,
+    "max_shares": 5,
+    "trade_cooldown_ms": 3000,
+    "dry_run": true,
+    "fill_timeout_ms": 10000,
+    "fill_poll_ms": 400,
+    "enabled": true
+  },
+  "workers": [
+    {
+      "asset": "btc",
+      "window": "5m"
+    },
+    {
+      "asset": "eth",
+      "window": "5m"
+    }
+  ]
+}

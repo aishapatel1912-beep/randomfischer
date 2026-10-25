@@ -1,0 +1,17 @@
+{
+  "total_pnl": -0.95,
+  "wins": 0,
+  "losses": 1,
+  "win_rate": "0.0%",
+  "total_trades": 1,
+  "last_updated": "2026-10-25 20:25:02",
+  "assets": {
+    "BTC_5M": {
+      "wins": 0,
+      "losses": 1,
+      "total_trades": 1,
+      "pnl": -0.95,
+      "win_rate": 0.0
+    }
+  }
+}
