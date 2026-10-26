@@ -41,6 +41,14 @@
     {
       "asset": "eth",
       "window": "5m"
+    },
+    {
+      "asset": "sol",
+      "window": "5m"
+    },
+    {
+      "asset": "xrp",
+      "window": "5m"
     }
   ]
 }

@@ -1,11 +1,22 @@
-"""Inventory accumulation with delayed initial hedge and cost-reduction DCA."""
+"""Inventory accumulation with profitability-first gates and falling-knife protection."""
 
 from __future__ import annotations
 
+import json
+import logging
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from strategies.inventory_accumulation_execution import fok_buy_with_retries, fok_paired_buy
+from utils.falling_knife_filter import (
+    FallingKnifeState,
+    evaluate_falling_knife,
+    record_buy_on_side,
+)
+from utils.profitability_gate import (
+    check_executable_depth,
+    evaluate_first_leg_gate,
+)
 from utils.inventory_balance import (
     BuyApproval,
     log_buy_plan,
@@ -31,6 +42,8 @@ from utils.inventory_strategy_store import (
 if TYPE_CHECKING:
     from bot import MarketWorker
 
+_LOG = logging.getLogger("inventory_accumulation")
+
 
 def _opposite(side: str) -> str:
     return "NO" if side.upper() == "YES" else "YES"
@@ -52,12 +65,96 @@ class InventoryAccumulationStrategy:
         worker.dashboard["combined_cost_target_c"] = round(cfg.combined_cost_target * 100, 2)
         worker.dashboard["market_exposure_usd"] = round(snap.total_exposure_usd(), 4)
 
+    def _slippage_reserve(self, worker: "MarketWorker") -> float:
+        cfg = worker.worker_config
+        return max(cfg.max_slippage, cfg.spread_capture_slippage_buffer)
+
+    def _knife_state(self, cycle: Optional[MarketCycleRecord]) -> FallingKnifeState:
+        if cycle is None:
+            return FallingKnifeState()
+        return FallingKnifeState.from_metadata(cycle.metadata.get("falling_knife"))
+
+    def _persist_knife_state(self, cycle: Optional[MarketCycleRecord], state: FallingKnifeState) -> None:
+        if cycle is None:
+            return
+        cycle.metadata["falling_knife"] = state.metadata_blob()
+        inventory_strategy_store.upsert(cycle)
+
+    def _log_gate_decision(
+        self,
+        worker: "MarketWorker",
+        *,
+        side: str,
+        qty: float,
+        purpose: str,
+        allowed: bool,
+        reason: str,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> None:
+        cfg = worker.worker_config
+        snap = InventorySnapshot.from_ledger(worker.inventory, fee_rate=cfg.spread_capture_fee_rate)
+        payload = {
+            "market": worker.canonical_market_id() or "",
+            "purpose": purpose,
+            "side": side,
+            "qty": qty,
+            "yes_ask": worker.best_ask("YES"),
+            "no_ask": worker.best_ask("NO"),
+            "yes_shares": snap.yes_shares,
+            "no_shares": snap.no_shares,
+            "matched": snap.matched_pairs,
+            "unmatched_yes": snap.unpaired_yes,
+            "unmatched_no": snap.unpaired_no,
+            "allowed": allowed,
+            "reason": reason,
+            "ts": time.time(),
+        }
+        if extra:
+            payload.update(extra)
+        worker.dashboard["last_gate_reason"] = reason
+        _LOG.info(json.dumps({"event": "accumulation_gate", **payload}))
+        if not allowed:
+            worker.dashboard["entry_block_reason"] = reason
+
+    def _falling_knife_blocks(
+        self, worker: "MarketWorker", side: str, ask: float, cycle: Optional[MarketCycleRecord],
+    ) -> Optional[str]:
+        cfg = worker.worker_config
+        if not cfg.falling_knife_filter_enabled:
+            return None
+        state = self._knife_state(cycle)
+        hist = worker.ask_history_for_knife(side)
+        block, reason, state = evaluate_falling_knife(
+            side=side,
+            ask=ask,
+            history=hist,
+            state=state,
+            enabled=True,
+            window_seconds=cfg.price_drop_window_seconds,
+            fast_window_seconds=cfg.gabagool_falling_knife_fast_window_seconds,
+            max_price_drop_fraction=cfg.max_price_drop_percent / 100.0,
+            fast_drop_fraction=cfg.gabagool_falling_knife_fast_drop,
+            cooldown_seconds=cfg.falling_knife_cooldown_seconds,
+            recovery_cents=cfg.gabagool_falling_knife_recovery_cents,
+            stabilization_window_seconds=cfg.stabilization_window_seconds,
+            stabilization_tolerance_percent=cfg.stabilization_tolerance_percent,
+            max_consecutive_buys=cfg.max_consecutive_buys_per_outcome,
+        )
+        self._persist_knife_state(cycle, state)
+        if block:
+            worker.dashboard["falling_knife_blocked"] = True
+            worker.dashboard["falling_knife_side"] = side
+            return reason
+        return None
+
     def _market_ready(self, worker: "MarketWorker") -> Optional[str]:
         from bot import is_locked_price
 
         cfg = worker.worker_config
         if not cfg.inventory_accumulation_enabled:
             return "inventory_accumulation_disabled"
+        if getattr(worker, "_ws_market_data_stale", False):
+            return "REJECT_STALE_ORDERBOOK"
         if not worker.active_market:
             return "no_active_market"
         if not worker.canonical_market_id():
@@ -74,7 +171,7 @@ class InventoryAccumulationStrategy:
             return "locked_outcome_price"
         age = worker.max_quote_age_seconds()
         if age is not None and age > cfg.max_quote_age_seconds:
-            return "stale_polymarket_data"
+            return "REJECT_STALE_ORDERBOOK"
         return None
 
     def _risk_blocks_buy(
@@ -100,11 +197,25 @@ class InventoryAccumulationStrategy:
         return None
 
     async def _record_fill(
-        self, worker: "MarketWorker", side: str, qty: float, px: float, oid: Optional[str],
+        self,
+        worker: "MarketWorker",
+        side: str,
+        qty: float,
+        px: float,
+        oid: Optional[str],
+        *,
+        cycle: Optional[MarketCycleRecord] = None,
+        paired: bool = False,
     ) -> None:
+        if oid and not worker.record_fill_idempotent(oid, side, qty, px):
+            return
         worker.inventory.record_buy(side, qty, px)
         worker.entry_count += 1
         worker.log_trade(side, px, "BUY", size=qty, order_id=oid)
+        if cycle is not None:
+            state = self._knife_state(cycle)
+            record_buy_on_side(state, side, paired=paired)
+            self._persist_knife_state(cycle, state)
 
     async def _try_cheap_entry(
         self, worker: "MarketWorker", cycle: Optional[MarketCycleRecord], cid: str,
@@ -143,6 +254,48 @@ class InventoryAccumulationStrategy:
             worker.dashboard["entry_block_reason"] = ev.reason
             return
 
+        opp = _opposite(side)
+        opp_exe = worker.executable_buy(opp, float(size))
+        opp_px = opp_exe[0] if opp_exe else worker.best_ask(opp)
+        depth_err = check_executable_depth(
+            yes_exe if side == "YES" else no_exe,
+            float(size),
+            min_orderbook_depth=cfg.min_orderbook_depth,
+        )
+        if depth_err:
+            self._log_gate_decision(
+                worker, side=side, qty=float(size), purpose="cheap_entry", allowed=False, reason=depth_err,
+            )
+            return
+        first_leg = evaluate_first_leg_gate(
+            side=side,
+            qty=float(size),
+            leg_executable_price=ev.executable_price,
+            opposite_executable_price=float(opp_px or 0),
+            fee_rate=cfg.spread_capture_fee_rate,
+            max_combined_cost=cfg.max_combined_cost,
+            min_net_profit_per_pair=cfg.min_net_profit_per_pair,
+            slippage_reserve=self._slippage_reserve(worker),
+            max_entry_price=cfg.max_entry_price,
+        )
+        if not first_leg.allowed:
+            self._log_gate_decision(
+                worker,
+                side=side,
+                qty=float(size),
+                purpose="cheap_entry",
+                allowed=False,
+                reason=first_leg.reason,
+                extra=first_leg.log_fields(),
+            )
+            return
+        knife = self._falling_knife_blocks(worker, side, ev.executable_price, cycle)
+        if knife:
+            self._log_gate_decision(
+                worker, side=side, qty=float(size), purpose="cheap_entry", allowed=False, reason=knife,
+            )
+            return
+
         plan = worker.plan_accumulation_buy(
             side, float(size), purpose="cheap_entry", allow_first_leg_entry=True,
         )
@@ -177,13 +330,13 @@ class InventoryAccumulationStrategy:
                 worker.dashboard["entry_block_reason"] = "cheap_entry_fok_failed"
                 return
 
-            await self._record_fill(worker, side, qty, px, oid)
             rec = inventory_strategy_store.start_cycle(
                 wkey,
                 cid,
                 first_leg_side=side,
                 hedge_delay_seconds=cfg.initial_hedge_delay_seconds,
             )
+            await self._record_fill(worker, side, qty, px, oid, cycle=rec)
             worker.dashboard["trade_phase"] = rec.phase.value
             worker.dashboard["entry_block_reason"] = ""
             print(
@@ -229,6 +382,17 @@ class InventoryAccumulationStrategy:
             return
 
         exe_px, _ = exe
+        depth_err = check_executable_depth(exe, hedge_qty, min_orderbook_depth=cfg.min_orderbook_depth)
+        if depth_err:
+            worker.dashboard["entry_block_reason"] = depth_err
+            return
+        knife = self._falling_knife_blocks(worker, hedge_side, exe_px, cycle)
+        if knife:
+            self._log_gate_decision(
+                worker, side=hedge_side, qty=hedge_qty, purpose="initial_hedge", allowed=False, reason=knife,
+            )
+            return
+
         limits = evaluate_initial_hedge(
             snap,
             hedge_side,
@@ -236,8 +400,21 @@ class InventoryAccumulationStrategy:
             exe_px,
             max_slippage=cfg.max_slippage,
             limit_price=exe_px + cfg.max_slippage,
+            max_combined_cost=cfg.max_combined_cost,
+            min_net_profit_per_pair=cfg.min_net_profit_per_pair,
+            slippage_reserve=self._slippage_reserve(worker),
         )
         if limits.decision != PurchaseDecision.BUY:
+            worker.dashboard["entry_block_reason"] = limits.reason
+            self._log_gate_decision(
+                worker,
+                side=hedge_side,
+                qty=hedge_qty,
+                purpose="initial_hedge",
+                allowed=False,
+                reason=limits.reason,
+                extra={"projected_combined": limits.resulting_combined},
+            )
             return
 
         plan = worker.plan_accumulation_buy(
@@ -264,12 +441,14 @@ class InventoryAccumulationStrategy:
                 return
             hedge_qty = plan.approved_qty
             worker.order_state = OrderState.PENDING
+            held_avg = snap.yes_avg() if hedge_side == "NO" else snap.no_avg()
+            max_hedge_px = min(exe_px + cfg.max_slippage, max(0.01, cfg.max_combined_cost - held_avg))
             qty, px, oid = await fok_buy_with_retries(
                 worker,
                 hedge_side,
                 hedge_qty,
                 purpose="initial_hedge",
-                max_price_cap=None,
+                max_price_cap=max_hedge_px if max_hedge_px > 0 else None,
                 max_retries=cfg.max_hedge_retries,
                 retry_delay_ms=cfg.hedge_retry_delay_ms,
             )
@@ -279,7 +458,7 @@ class InventoryAccumulationStrategy:
                 inventory_strategy_store.upsert(cycle)
                 return
 
-            await self._record_fill(worker, hedge_side, qty, px, oid)
+            await self._record_fill(worker, hedge_side, qty, px, oid, cycle=cycle)
             cycle.initial_hedge_complete = True
             cycle.phase = AccumulationPhase.ACCUMULATING
             combined = matched_combined_average(
@@ -336,6 +515,18 @@ class InventoryAccumulationStrategy:
             worker.dashboard["entry_block_reason"] = "paired_dca_no_liquidity"
             return
         yes_px, no_px = yes_exe[0], no_exe[0]
+        if check_executable_depth(yes_exe, qty, min_orderbook_depth=cfg.min_orderbook_depth):
+            worker.dashboard["entry_block_reason"] = "REJECT_INSUFFICIENT_DEPTH"
+            return
+        if check_executable_depth(no_exe, qty, min_orderbook_depth=cfg.min_orderbook_depth):
+            worker.dashboard["entry_block_reason"] = "REJECT_INSUFFICIENT_DEPTH"
+            return
+        for s, px in (("YES", yes_px), ("NO", no_px)):
+            knife = self._falling_knife_blocks(worker, s, px, cycle)
+            if knife:
+                worker.dashboard["entry_block_reason"] = knife
+                return
+
         ev = evaluate_paired_dca_purchase(
             snap,
             qty,
@@ -343,6 +534,8 @@ class InventoryAccumulationStrategy:
             no_px,
             combined_cost_target=cfg.combined_cost_target,
             max_combined_cost=cfg.max_combined_cost,
+            min_net_profit_per_pair=cfg.min_net_profit_per_pair,
+            slippage_reserve=self._slippage_reserve(worker),
         )
         if ev.decision != PurchaseDecision.BUY:
             worker.dashboard["entry_block_reason"] = ev.reason
@@ -380,12 +573,12 @@ class InventoryAccumulationStrategy:
             worker.order_state = OrderState.IDLE
             if yq <= MIN_SHARES - 1e-9:
                 return
-            await self._record_fill(worker, "YES", yq, yp, y_oid)
+            await self._record_fill(worker, "YES", yq, yp, y_oid, cycle=cycle, paired=False)
             if nq <= MIN_SHARES - 1e-9:
                 cycle.metadata["paired_dca_paused"] = True
                 inventory_strategy_store.upsert(cycle)
                 return
-            await self._record_fill(worker, "NO", nq, np, n_oid)
+            await self._record_fill(worker, "NO", nq, np, n_oid, cycle=cycle, paired=True)
             if ev.target_achieved:
                 cycle.target_achieved = True
                 cycle.phase = AccumulationPhase.TARGET_ACHIEVED
@@ -435,6 +628,10 @@ class InventoryAccumulationStrategy:
             worker.dashboard["entry_block_reason"] = "rebalance_no_liquidity"
             return
         exe_px, _ = exe
+        knife = self._falling_knife_blocks(worker, side, exe_px, cycle)
+        if knife:
+            worker.dashboard["entry_block_reason"] = knife
+            return
         ev = evaluate_dca_purchase(
             snap,
             side,
@@ -443,6 +640,8 @@ class InventoryAccumulationStrategy:
             combined_cost_target=cfg.combined_cost_target,
             max_combined_cost=cfg.max_combined_cost,
             require_improvement=False,
+            min_net_profit_per_pair=cfg.min_net_profit_per_pair,
+            slippage_reserve=self._slippage_reserve(worker),
         )
         if ev.decision != PurchaseDecision.BUY:
             worker.dashboard["entry_block_reason"] = ev.reason
@@ -471,7 +670,7 @@ class InventoryAccumulationStrategy:
             worker.order_state = OrderState.IDLE
             if qty <= MIN_SHARES - 1e-9:
                 return
-            await self._record_fill(worker, side, qty, px, oid)
+            await self._record_fill(worker, side, qty, px, oid, cycle=cycle)
             eff_after = worker.effective_inventory()
             if eff_after.share_imbalance_effective <= cfg.max_share_imbalance + 1e-9:
                 cycle.metadata.pop("paired_dca_paused", None)

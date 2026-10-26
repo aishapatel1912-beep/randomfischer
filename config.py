@@ -259,6 +259,16 @@ class WorkerConfig:
     inventory_dca_min_price_move: float = 0.03
     inventory_max_imbalance_seconds: float = 7200.0
     inventory_max_active_orders: int = 4
+    min_net_profit_per_pair: float = 0.02
+    force_hedge_after_timeout: bool = False
+    max_consecutive_buys_per_outcome: int = 3
+    stabilization_window_seconds: float = 15.0
+    stabilization_tolerance_percent: float = 0.02
+    min_orderbook_depth: float = 5.0
+    falling_knife_filter_enabled: bool = True
+    price_drop_window_seconds: float = 15.0
+    max_price_drop_percent: float = 3.5
+    falling_knife_cooldown_seconds: float = 5.0
     binance_fok_enabled: bool = True
     binance_fok_signal_windows_ms: tuple = (1000.0, 3000.0, 5000.0)
     binance_fok_up_move_threshold_pct: float = 0.0008
@@ -745,6 +755,116 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     inventory_max_active_orders = int(
         _cfg_get(raw, defaults, "inventory_max_active_orders", default=4) or 4
     )
+    min_net_profit_per_pair = _parse_nonnegative_float(
+        "min_net_profit_per_pair",
+        os.getenv(
+            "MIN_NET_PROFIT_PER_PAIR",
+            _cfg_get(
+                raw,
+                defaults,
+                "min_net_profit_per_pair",
+                "inventory_min_net_edge",
+                "gabagool_min_profit_margin",
+                default=0.02,
+            ),
+        ),
+        0.02,
+    )
+    force_hedge_after_timeout = _parse_bool_value(
+        "force_hedge_after_timeout",
+        os.getenv(
+            "FORCE_HEDGE_AFTER_TIMEOUT",
+            _cfg_get(raw, defaults, "force_hedge_after_timeout", default=False),
+        ),
+        False,
+    )
+    max_consecutive_buys_raw = _cfg_get(
+        raw, defaults, "max_consecutive_buys_per_outcome", default=3,
+    )
+    try:
+        max_consecutive_buys_per_outcome = int(max_consecutive_buys_raw)
+    except (TypeError, ValueError):
+        _fatal(f"max_consecutive_buys_per_outcome={max_consecutive_buys_raw!r} is not a valid integer")
+    if max_consecutive_buys_per_outcome < 0:
+        _fatal(f"{asset}:{window}: max_consecutive_buys_per_outcome must be >= 0")
+    stabilization_window_seconds = _parse_nonnegative_float(
+        "stabilization_window_seconds",
+        _cfg_get(raw, defaults, "stabilization_window_seconds", default=15.0),
+        15.0,
+    )
+    stabilization_tolerance_percent = _parse_nonnegative_float(
+        "stabilization_tolerance_percent",
+        _cfg_get(raw, defaults, "stabilization_tolerance_percent", default=0.02),
+        0.02,
+    )
+    min_orderbook_depth = _parse_order_size(
+        "min_orderbook_depth",
+        os.getenv(
+            "MIN_ORDERBOOK_DEPTH",
+            _cfg_get(
+                raw,
+                defaults,
+                "min_orderbook_depth",
+                "spread_capture_min_book_liquidity",
+                default=5.0,
+            ),
+        ),
+        5.0,
+    )
+    falling_knife_filter_enabled = _parse_bool_value(
+        "falling_knife_filter_enabled",
+        os.getenv(
+            "FALLING_KNIFE_FILTER_ENABLED",
+            _cfg_get(
+                raw,
+                defaults,
+                "falling_knife_filter_enabled",
+                "gabagool_falling_knife_enabled",
+                default=True,
+            ),
+        ),
+        True,
+    )
+    price_drop_window_seconds = _parse_nonnegative_float(
+        "price_drop_window_seconds",
+        os.getenv(
+            "PRICE_DROP_WINDOW_SECONDS",
+            _cfg_get(
+                raw,
+                defaults,
+                "price_drop_window_seconds",
+                "gabagool_falling_knife_window_seconds",
+                default=15.0,
+            ),
+        ),
+        15.0,
+    )
+    max_price_drop_percent = _parse_nonnegative_float(
+        "max_price_drop_percent",
+        os.getenv(
+            "MAX_PRICE_DROP_PERCENT",
+            _cfg_get(raw, defaults, "max_price_drop_percent", default=3.5),
+        ),
+        3.5,
+    )
+    falling_knife_cooldown_seconds = _parse_nonnegative_float(
+        "falling_knife_cooldown_seconds",
+        os.getenv(
+            "FALLING_KNIFE_COOLDOWN_SECONDS",
+            _cfg_get(
+                raw,
+                defaults,
+                "falling_knife_cooldown_seconds",
+                "gabagool_falling_knife_cooldown_seconds",
+                default=5.0,
+            ),
+        ),
+        5.0,
+    )
+    if price_drop_window_seconds <= 0:
+        _fatal(f"{asset}:{window}: price_drop_window_seconds must be > 0")
+    if stabilization_window_seconds <= 0:
+        _fatal(f"{asset}:{window}: stabilization_window_seconds must be > 0")
     from utils.btc_signal import parse_signal_windows_ms
 
     binance_fok_enabled = _parse_bool_value(
@@ -1030,6 +1150,16 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         inventory_dca_min_price_move=inventory_dca_min_price_move,
         inventory_max_imbalance_seconds=inventory_max_imbalance_seconds,
         inventory_max_active_orders=inventory_max_active_orders,
+        min_net_profit_per_pair=min_net_profit_per_pair,
+        force_hedge_after_timeout=force_hedge_after_timeout,
+        max_consecutive_buys_per_outcome=max_consecutive_buys_per_outcome,
+        stabilization_window_seconds=stabilization_window_seconds,
+        stabilization_tolerance_percent=stabilization_tolerance_percent,
+        min_orderbook_depth=min_orderbook_depth,
+        falling_knife_filter_enabled=falling_knife_filter_enabled,
+        price_drop_window_seconds=price_drop_window_seconds,
+        max_price_drop_percent=max_price_drop_percent,
+        falling_knife_cooldown_seconds=falling_knife_cooldown_seconds,
         binance_fok_enabled=binance_fok_enabled,
         binance_fok_signal_windows_ms=binance_fok_signal_windows_ms,
         binance_fok_up_move_threshold_pct=binance_fok_up_move_threshold_pct,

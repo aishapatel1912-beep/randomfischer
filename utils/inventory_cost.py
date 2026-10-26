@@ -122,21 +122,42 @@ def evaluate_initial_hedge(
     *,
     max_slippage: float,
     limit_price: float,
+    max_combined_cost: float = 1.0,
+    min_net_profit_per_pair: float = 0.0,
+    slippage_reserve: float = 0.0,
 ) -> PurchaseEvaluation:
+    from utils.profitability_gate import evaluate_initial_hedge_gate
+
     if qty <= _EPS:
         return PurchaseEvaluation(PurchaseDecision.SKIP, "zero_hedge_qty", executable_price, None, None)
     if executable_price <= 0:
         return PurchaseEvaluation(PurchaseDecision.SKIP, "no_executable_hedge_price", 0.0, None, None)
     if limit_price + _EPS < executable_price:
         return PurchaseEvaluation(PurchaseDecision.SKIP, "hedge_limit_below_executable", executable_price, None, None)
-    after = snap.with_buy(opposite_side, qty, executable_price)
-    new_c = matched_combined_average(after)
+    gate = evaluate_initial_hedge_gate(
+        snap,
+        opposite_side,
+        qty,
+        executable_price,
+        max_combined_cost=max_combined_cost,
+        min_net_profit_per_pair=min_net_profit_per_pair,
+        slippage_reserve=slippage_reserve,
+    )
+    current = matched_combined_average(snap)
+    if not gate.allowed:
+        return PurchaseEvaluation(
+            PurchaseDecision.SKIP,
+            gate.reason,
+            executable_price,
+            gate.projected_combined,
+            current,
+        )
     return PurchaseEvaluation(
         PurchaseDecision.BUY,
         "initial_hedge_allowed",
         executable_price,
-        new_c,
-        matched_combined_average(snap),
+        gate.projected_combined,
+        current,
     )
 
 
@@ -149,6 +170,8 @@ def evaluate_dca_purchase(
     combined_cost_target: float,
     max_combined_cost: float,
     require_improvement: bool = True,
+    min_net_profit_per_pair: float = 0.0,
+    slippage_reserve: float = 0.0,
 ) -> PurchaseEvaluation:
     if qty <= _EPS or executable_price <= 0:
         return PurchaseEvaluation(PurchaseDecision.SKIP, "invalid_dca_qty_or_price", executable_price, None, None)
@@ -171,8 +194,20 @@ def evaluate_dca_purchase(
     if resulting > max_combined_cost + _EPS:
         if current is None or resulting >= current - _EPS:
             return PurchaseEvaluation(
-                PurchaseDecision.SKIP, "exceeds_max_combined_cost", executable_price, resulting, current,
+                PurchaseDecision.SKIP, "REJECT_COMBINED_COST_TOO_HIGH", executable_price, resulting, current,
             )
+
+    from utils.profitability_gate import projected_net_profit_per_pair
+
+    net_p = projected_net_profit_per_pair(resulting, slippage_reserve=slippage_reserve)
+    if net_p + _EPS < min_net_profit_per_pair:
+        return PurchaseEvaluation(
+            PurchaseDecision.SKIP,
+            "REJECT_NET_PROFIT_TOO_LOW",
+            executable_price,
+            resulting,
+            current,
+        )
 
     target_hit = resulting <= combined_cost_target + _EPS
     if target_hit and current is not None and current <= combined_cost_target + _EPS:
@@ -201,6 +236,8 @@ def evaluate_paired_dca_purchase(
     combined_cost_target: float,
     max_combined_cost: float,
     require_improvement: bool = True,
+    min_net_profit_per_pair: float = 0.0,
+    slippage_reserve: float = 0.0,
 ) -> PurchaseEvaluation:
     """Evaluate buying equal qty on YES and NO (matched pair expansion)."""
     if qty <= _EPS or yes_executable_price <= 0 or no_executable_price <= 0:
@@ -224,8 +261,19 @@ def evaluate_paired_dca_purchase(
     if resulting > max_combined_cost + _EPS:
         if current is None or resulting >= current - _EPS:
             return PurchaseEvaluation(
-                PurchaseDecision.SKIP, "exceeds_max_combined_cost", yes_executable_price, resulting, current,
+                PurchaseDecision.SKIP, "REJECT_COMBINED_COST_TOO_HIGH", yes_executable_price, resulting, current,
             )
+    from utils.profitability_gate import projected_net_profit_per_pair
+
+    net_p = projected_net_profit_per_pair(resulting, slippage_reserve=slippage_reserve)
+    if net_p + _EPS < min_net_profit_per_pair:
+        return PurchaseEvaluation(
+            PurchaseDecision.SKIP,
+            "REJECT_NET_PROFIT_TOO_LOW",
+            yes_executable_price,
+            resulting,
+            current,
+        )
     target_hit = resulting <= combined_cost_target + _EPS
     return PurchaseEvaluation(
         PurchaseDecision.BUY,

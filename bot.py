@@ -2796,6 +2796,8 @@ class MarketWorker:
         self._knife_block_until: Dict[str, float] = {"YES": 0.0, "NO": 0.0}
         self._knife_low: Dict[str, float] = {"YES": 0.0, "NO": 0.0}
         self._knife_latched: Dict[str, bool] = {"YES": False, "NO": False}
+        self._ws_market_data_stale: bool = False
+        self._processed_fill_order_ids: set[str] = set()
 
         self.market_outcome  = None
         self.final_yes_price = 0.0
@@ -3154,11 +3156,28 @@ class MarketWorker:
         if ask_size > 0:
             self.ask_sizes[side] = float(ask_size)
 
+    def ask_history_for_knife(self, side: str) -> list[tuple[float, float]]:
+        """Wall-clock ask samples for falling-knife filter."""
+        return list(self._ask_history.get(side.upper(), ()))
+
+    def record_fill_idempotent(
+        self, order_id: Optional[str], side: str, qty: float, px: float,
+    ) -> bool:
+        """Return False when this fill was already applied (duplicate event)."""
+        if not order_id or order_id in ("dry-run",):
+            return True
+        key = f"{order_id}:{side}:{qty:.6f}:{px:.6f}"
+        if key in self._processed_fill_order_ids:
+            return False
+        self._processed_fill_order_ids.add(key)
+        return True
+
     def _record_ask_snapshot(self, side: str, price: float) -> None:
         if price <= 0:
             return
         self._touch_quote(side)
-        now = t.monotonic()
+        self._ws_market_data_stale = False
+        now = t.time()
         hist = self._ask_history[side]
         hist.append((now, float(price)))
         low = self._knife_low.get(side, 0.0)
@@ -3877,6 +3896,12 @@ class MarketWorker:
             except websockets.exceptions.ConnectionClosed:
                 print("\n⚠️ Connection lost. Reconnecting in 3s...")
                 self._book_cache.clear()
+                self._ws_market_data_stale = True
+                self._ask_history = {"YES": deque(maxlen=80), "NO": deque(maxlen=80)}
+                self._knife_block_until = {"YES": 0.0, "NO": 0.0}
+                self._knife_low = {"YES": 0.0, "NO": 0.0}
+                self._knife_latched = {"YES": False, "NO": False}
+                self.dashboard["entry_block_reason"] = "REJECT_STALE_ORDERBOOK"
                 await self.cancel_all_open_orders()
                 await asyncio.sleep(3)
                 continue

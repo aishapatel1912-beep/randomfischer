@@ -73,13 +73,14 @@ class CostBasisTests(unittest.TestCase):
         )
         self.assertEqual(side, "NO")
 
-    def test_initial_hedge_allowed_above_dollar(self):
+    def test_initial_hedge_rejected_above_max_combined(self):
         snap = InventorySnapshot(yes_shares=100, no_shares=0, yes_cost=35, no_cost=0)
         ev = evaluate_initial_hedge(
             snap, "NO", 100, 0.67, max_slippage=0.01, limit_price=0.68,
+            max_combined_cost=0.96, min_net_profit_per_pair=0.02, slippage_reserve=0.005,
         )
-        self.assertEqual(ev.decision, PurchaseDecision.BUY)
-        self.assertAlmostEqual(ev.resulting_combined or 0, 1.02)
+        self.assertEqual(ev.decision, PurchaseDecision.SKIP)
+        self.assertEqual(ev.reason, "REJECT_COMBINED_COST_TOO_HIGH")
 
     def test_dca_skips_without_improvement(self):
         snap = InventorySnapshot(yes_shares=100, no_shares=100, yes_cost=35, no_cost=65)
