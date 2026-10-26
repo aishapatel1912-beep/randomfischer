@@ -6,7 +6,7 @@
     "target_combined_pair_cost": 0.98,
     "max_combined_pair_cost": 0.98,
     "max_entries_per_side_per_market": 1,
-    "no_buys_last_minutes": 2,
+    "no_buys_last_minutes": 0,
     "combined_cost_target": 0.98,
     "max_combined_cost": 0.98,
     "min_net_profit_per_pair": 0.0,
