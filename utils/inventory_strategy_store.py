@@ -14,12 +14,20 @@ from typing import Any, Dict, Optional
 
 
 class AccumulationPhase(str, Enum):
-    IDLE = "IDLE"
-    FIRST_LEG_OPEN = "FIRST_LEG_OPEN"
-    HEDGE_DUE = "HEDGE_DUE"
-    ACCUMULATING = "ACCUMULATING"
-    TARGET_ACHIEVED = "TARGET_ACHIEVED"
-    CLOSED = "CLOSED"
+    WAITING_FOR_FIRST_ENTRY = "WAITING_FOR_FIRST_ENTRY"
+    FIRST_ENTRY_PENDING = "FIRST_ENTRY_PENDING"
+    WAITING_FOR_OPPOSITE_ENTRY = "WAITING_FOR_OPPOSITE_ENTRY"
+    OPPOSITE_ENTRY_PENDING = "OPPOSITE_ENTRY_PENDING"
+    PAIR_COMPLETED = "PAIR_COMPLETED"
+    ENTRY_WINDOW_CLOSED = "ENTRY_WINDOW_CLOSED"
+    RISK_BLOCKED = "RISK_BLOCKED"
+    # Legacy (migrated on read)
+    IDLE = "WAITING_FOR_FIRST_ENTRY"
+    FIRST_LEG_OPEN = "WAITING_FOR_OPPOSITE_ENTRY"
+    HEDGE_DUE = "WAITING_FOR_OPPOSITE_ENTRY"
+    ACCUMULATING = "PAIR_COMPLETED"
+    TARGET_ACHIEVED = "PAIR_COMPLETED"
+    CLOSED = "ENTRY_WINDOW_CLOSED"
 
 
 @dataclass
@@ -76,12 +84,30 @@ class InventoryStrategyStore:
         with self._lock:
             self._conn.close()
 
+    @staticmethod
+    def _normalize_phase(raw: str) -> AccumulationPhase:
+        token = str(raw or "").strip()
+        legacy_map = {
+            "IDLE": AccumulationPhase.WAITING_FOR_FIRST_ENTRY,
+            "FIRST_LEG_OPEN": AccumulationPhase.WAITING_FOR_OPPOSITE_ENTRY,
+            "HEDGE_DUE": AccumulationPhase.WAITING_FOR_OPPOSITE_ENTRY,
+            "ACCUMULATING": AccumulationPhase.PAIR_COMPLETED,
+            "TARGET_ACHIEVED": AccumulationPhase.PAIR_COMPLETED,
+            "CLOSED": AccumulationPhase.ENTRY_WINDOW_CLOSED,
+        }
+        if token in legacy_map:
+            return legacy_map[token]
+        try:
+            return AccumulationPhase(token)
+        except ValueError:
+            return AccumulationPhase.WAITING_FOR_FIRST_ENTRY
+
     def _row(self, row: sqlite3.Row) -> MarketCycleRecord:
         return MarketCycleRecord(
             cycle_id=str(row["cycle_id"]),
             worker_key=str(row["worker_key"]),
             condition_id=str(row["condition_id"]),
-            phase=AccumulationPhase(str(row["phase"])),
+            phase=self._normalize_phase(str(row["phase"])),
             first_leg_side=str(row["first_leg_side"] or ""),
             first_fill_at=float(row["first_fill_at"] or 0),
             hedge_deadline_at=float(row["hedge_deadline_at"] or 0),
@@ -94,10 +120,15 @@ class InventoryStrategyStore:
 
     def active_cycle(self, worker_key: str) -> Optional[MarketCycleRecord]:
         phases = (
-            AccumulationPhase.FIRST_LEG_OPEN.value,
-            AccumulationPhase.HEDGE_DUE.value,
-            AccumulationPhase.ACCUMULATING.value,
-            AccumulationPhase.TARGET_ACHIEVED.value,
+            AccumulationPhase.WAITING_FOR_FIRST_ENTRY.value,
+            AccumulationPhase.FIRST_ENTRY_PENDING.value,
+            AccumulationPhase.WAITING_FOR_OPPOSITE_ENTRY.value,
+            AccumulationPhase.OPPOSITE_ENTRY_PENDING.value,
+            "FIRST_LEG_OPEN",
+            "HEDGE_DUE",
+            "ACCUMULATING",
+            "TARGET_ACHIEVED",
+            "IDLE",
         )
         ph = ",".join("?" for _ in phases)
         with self._lock:
@@ -163,29 +194,47 @@ class InventoryStrategyStore:
             )
             self._conn.commit()
 
+    def get_or_create_cycle(self, worker_key: str, condition_id: str) -> MarketCycleRecord:
+        existing = self.cycle_for_market(worker_key, condition_id)
+        if existing:
+            return existing
+        now = time.time()
+        rec = MarketCycleRecord(
+            cycle_id=str(uuid.uuid4()),
+            worker_key=worker_key,
+            condition_id=condition_id,
+            phase=AccumulationPhase.WAITING_FOR_FIRST_ENTRY,
+            first_leg_side="",
+            first_fill_at=0.0,
+            hedge_deadline_at=0.0,
+            initial_hedge_complete=False,
+            target_achieved=False,
+            hedge_retries=0,
+            metadata={"entries": {}},
+            updated_at=now,
+        )
+        self.upsert(rec)
+        return rec
+
     def start_cycle(
         self,
         worker_key: str,
         condition_id: str,
         *,
         first_leg_side: str,
-        hedge_delay_seconds: float,
+        hedge_delay_seconds: float = 0.0,
     ) -> MarketCycleRecord:
+        """Begin opposite-side wait after confirmed first-leg fill."""
         now = time.time()
-        rec = MarketCycleRecord(
-            cycle_id=str(uuid.uuid4()),
-            worker_key=worker_key,
-            condition_id=condition_id,
-            phase=AccumulationPhase.FIRST_LEG_OPEN,
-            first_leg_side=first_leg_side,
-            first_fill_at=now,
-            hedge_deadline_at=now + max(0.0, float(hedge_delay_seconds)),
-            initial_hedge_complete=False,
-            target_achieved=False,
-            hedge_retries=0,
-            metadata={},
-            updated_at=now,
-        )
+        rec = self.cycle_for_market(worker_key, condition_id)
+        if rec is None:
+            rec = self.get_or_create_cycle(worker_key, condition_id)
+        rec.first_leg_side = first_leg_side
+        rec.first_fill_at = now
+        rec.hedge_deadline_at = now
+        rec.phase = AccumulationPhase.WAITING_FOR_OPPOSITE_ENTRY
+        rec.initial_hedge_complete = False
+        rec.metadata.setdefault("entries", {})
         self.upsert(rec)
         return rec
 

@@ -181,12 +181,18 @@ class WorkerConfig:
     stop_loss_pct: float = 0.35
     price_99_entry_window_seconds: int = 60
     inventory_accumulation_enabled: bool = True
-    cheap_entry_price: float = 0.35
-    initial_hedge_delay_seconds: int = 10
+    cheap_side_min_price: float = 0.10
+    cheap_side_max_price: float = 0.20
+    target_combined_pair_cost: float = 0.98
+    max_combined_pair_cost: float = 0.98
+    max_entries_per_side_per_market: int = 1
+    no_buys_last_minutes: int = 2
+    cheap_entry_price: float = 0.20
+    initial_hedge_delay_seconds: int = 0
     combined_cost_target: float = 0.98
-    max_combined_cost: float = 1.0
+    max_combined_cost: float = 0.98
     entry_window_seconds: int = 60
-    max_entry_price: float = 0.35
+    max_entry_price: float = 0.20
     order_type: str = "FOK"
     max_slippage: float = 0.005
     max_quote_age_seconds: float = 3.0
@@ -375,41 +381,75 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     if entry_window_seconds < 0 or entry_window_seconds > 900:
         _fatal("entry_window_seconds must be between 0 and 900 (0 = no window limit)")
 
-    cheap_raw = _cfg_get(raw, defaults, "cheap_entry_price", default=0.35)
-    env_cheap = os.getenv("CHEAP_ENTRY_PRICE", "").strip()
-    if env_cheap:
-        cheap_raw = env_cheap
-    cheap_entry_price = _parse_unit_fraction("cheap_entry_price", cheap_raw, 0.35)
+    cheap_min_raw = _cfg_get(raw, defaults, "cheap_side_min_price", default=0.10)
+    env_cheap_min = os.getenv("CHEAP_SIDE_MIN_PRICE", "").strip()
+    if env_cheap_min:
+        cheap_min_raw = env_cheap_min
+    cheap_side_min_price = _parse_unit_fraction("cheap_side_min_price", cheap_min_raw, 0.10)
 
-    max_entry_raw = _cfg_get(raw, defaults, "max_entry_price", default=0.35)
-    env_max_entry = os.getenv("MAX_ENTRY_PRICE", "").strip()
-    if env_max_entry:
-        max_entry_raw = env_max_entry
-    max_entry_price = _parse_unit_fraction("max_entry_price", max_entry_raw, 0.35)
-    if cheap_entry_price > max_entry_price + 1e-9:
+    cheap_max_raw = _cfg_get(raw, defaults, "cheap_side_max_price", default=0.20)
+    env_cheap_max = os.getenv("CHEAP_SIDE_MAX_PRICE", "").strip()
+    if env_cheap_max:
+        cheap_max_raw = env_cheap_max
+    cheap_side_max_price = _parse_unit_fraction("cheap_side_max_price", cheap_max_raw, 0.20)
+    if cheap_side_min_price > cheap_side_max_price + 1e-9:
         _fatal(
-            f"{asset}:{window}: cheap_entry_price={cheap_entry_price} "
-            f"cannot exceed max_entry_price={max_entry_price}"
+            f"{asset}:{window}: cheap_side_min_price={cheap_side_min_price} "
+            f"cannot exceed cheap_side_max_price={cheap_side_max_price}"
         )
 
-    combined_target_raw = _cfg_get(raw, defaults, "combined_cost_target", default=0.98)
-    env_target = os.getenv("COMBINED_COST_TARGET", "").strip()
+    combined_target_raw = _cfg_get(
+        raw, defaults, "target_combined_pair_cost", "combined_cost_target", default=0.98,
+    )
+    env_target = os.getenv("TARGET_COMBINED_PAIR_COST", "").strip()
+    if not env_target:
+        env_target = os.getenv("COMBINED_COST_TARGET", "").strip()
     if env_target:
         combined_target_raw = env_target
-    combined_cost_target = _parse_unit_fraction("combined_cost_target", combined_target_raw, 0.98)
+    target_combined_pair_cost = _parse_unit_fraction(
+        "target_combined_pair_cost", combined_target_raw, 0.98,
+    )
+    combined_cost_target = target_combined_pair_cost
 
-    max_combined_raw = _cfg_get(raw, defaults, "max_combined_cost", default=1.0)
-    env_max_combined = os.getenv("MAX_COMBINED_COST", "").strip()
+    max_combined_raw = _cfg_get(
+        raw, defaults, "max_combined_pair_cost", "max_combined_cost", default=0.98,
+    )
+    env_max_combined = os.getenv("MAX_COMBINED_PAIR_COST", "").strip()
+    if not env_max_combined:
+        env_max_combined = os.getenv("MAX_COMBINED_COST", "").strip()
     if env_max_combined:
         max_combined_raw = env_max_combined
-    max_combined_cost = _parse_unit_fraction("max_combined_cost", max_combined_raw, 1.0)
+    max_combined_pair_cost = _parse_unit_fraction("max_combined_pair_cost", max_combined_raw, 0.98)
+    max_combined_cost = max_combined_pair_cost
     if combined_cost_target > max_combined_cost + 1e-9:
         _fatal(
-            f"{asset}:{window}: combined_cost_target={combined_cost_target} "
-            f"cannot exceed max_combined_cost={max_combined_cost}"
+            f"{asset}:{window}: target_combined_pair_cost={combined_cost_target} "
+            f"cannot exceed max_combined_pair_cost={max_combined_cost}"
         )
 
-    hedge_delay_raw = _cfg_get(raw, defaults, "initial_hedge_delay_seconds", default=10)
+    cheap_entry_price = cheap_side_max_price
+    max_entry_price = cheap_side_max_price
+
+    max_entries_raw = _cfg_get(raw, defaults, "max_entries_per_side_per_market", default=1)
+    try:
+        max_entries_per_side_per_market = int(max_entries_raw)
+    except (TypeError, ValueError):
+        _fatal(f"max_entries_per_side_per_market={max_entries_raw!r} is not a valid integer")
+    if max_entries_per_side_per_market < 1:
+        _fatal(f"{asset}:{window}: max_entries_per_side_per_market must be >= 1")
+
+    no_buys_raw = _cfg_get(raw, defaults, "no_buys_last_minutes", default=2)
+    env_no_buys = os.getenv("NO_BUYS_LAST_MINUTES", "").strip()
+    if env_no_buys:
+        no_buys_raw = env_no_buys
+    try:
+        no_buys_last_minutes = int(no_buys_raw)
+    except (TypeError, ValueError):
+        _fatal(f"no_buys_last_minutes={no_buys_raw!r} is not a valid integer")
+    if no_buys_last_minutes < 0:
+        _fatal(f"{asset}:{window}: no_buys_last_minutes must be >= 0")
+
+    hedge_delay_raw = _cfg_get(raw, defaults, "initial_hedge_delay_seconds", default=0)
     env_hedge_delay = os.getenv("INITIAL_HEDGE_DELAY_SECONDS", "").strip()
     if env_hedge_delay:
         hedge_delay_raw = env_hedge_delay
@@ -1074,6 +1114,12 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         stop_loss_pct=stop_loss_pct,
         price_99_entry_window_seconds=price_99_entry_window_seconds,
         inventory_accumulation_enabled=inventory_accumulation_enabled,
+        cheap_side_min_price=cheap_side_min_price,
+        cheap_side_max_price=cheap_side_max_price,
+        target_combined_pair_cost=target_combined_pair_cost,
+        max_combined_pair_cost=max_combined_pair_cost,
+        max_entries_per_side_per_market=max_entries_per_side_per_market,
+        no_buys_last_minutes=no_buys_last_minutes,
         cheap_entry_price=cheap_entry_price,
         initial_hedge_delay_seconds=initial_hedge_delay_seconds,
         combined_cost_target=combined_cost_target,
